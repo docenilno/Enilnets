@@ -17,6 +17,13 @@ building on before you rely on it.
 
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Examples](#examples)
+  - [MNIST (image classification)](#mnist-image-classification)
+  - [CIFAR-10 (deeper conv classifier)](#cifar-10-deeper-conv-classifier)
+  - [Text generation](#example-text-generation)
+  - [Reinforcement learning](#example-reinforcement-learning)
+  - [GAN](#example-gan)
+  - [Diffusion](#example-diffusion)
 - [Core concepts](#core-concepts)
   - [The `NeuralNet` object](#the-neuralnet-object)
   - [Auto shape inference](#auto-shape-inference)
@@ -112,6 +119,160 @@ history = model.Train(X_train, y_train, epochs=20, batch_size=32,
 
 preds = model.Forward(X_val, training=False)
 print("val accuracy:", model.compute_accuracy(preds, y_val))
+```
+
+## Examples
+
+Six compact, runnable examples covering the most common use cases. Each one
+uses synthetic data shaped like the real dataset it names (so you can
+copy-paste and run immediately with no downloads) — swap in real
+`X_train`/`y_train` for actual results.
+
+### MNIST (image classification)
+
+```python
+import numpy as np
+from Enilnets import NeuralNet
+
+np.random.seed(0)
+# Replace with real MNIST: X_train (N,1,28,28) in [0,1], y_train one-hot (N,10)
+X_train = np.random.rand(200, 1, 28, 28)
+y_train = np.eye(10)[np.random.randint(0, 10, 200)]
+X_val, y_val = X_train[:40], y_train[:40]
+
+model = NeuralNet(learning_rate=0.001, optimizer="adam")
+model.add_conv_block(out_ch=16, k=3, in_ch=1, batchnorm=True, pool="max", input_size=(28, 28))
+model.add_conv_block(out_ch=32, k=3, batchnorm=True, pool="max")
+model.add_flatten()
+model.add_dense(n_out=64, activation="relu")
+model.add_dense(n_out=10, activation="softmax")
+
+model.Train(X_train, y_train, epochs=3, batch_size=32, X_val=X_val, Y_val=y_val,
+            loss_function="cross_entropy", verbose=True)
+
+preds = model.Forward(X_val, training=False)
+print("val accuracy:", model.compute_accuracy(preds, y_val))
+```
+
+### CIFAR-10 (deeper conv classifier)
+
+```python
+import numpy as np
+from Enilnets import NeuralNet
+
+np.random.seed(0)
+# Replace with real CIFAR-10: X_train (N,3,32,32) in [0,1], y_train one-hot (N,10)
+X_train = np.random.rand(200, 3, 32, 32)
+y_train = np.eye(10)[np.random.randint(0, 10, 200)]
+X_val, y_val = X_train[:40], y_train[:40]
+
+model = NeuralNet(learning_rate=0.001, optimizer="adamw", l2_lambda=0.0001)
+model.add_conv_block(out_ch=32, k=3, in_ch=3, batchnorm=True, pool="max", input_size=(32, 32))
+model.add_conv_block(out_ch=64, k=3, batchnorm=True, pool="max")
+model.add_conv_block(out_ch=128, k=3, batchnorm=True, pool="max")
+model.add_global_avgpool2d()
+model.add_flatten()
+model.add_dense(n_out=10, activation="softmax")
+
+model.Train(X_train, y_train, epochs=3, batch_size=32, X_val=X_val, Y_val=y_val,
+            loss_function="cross_entropy", verbose=True)
+
+preds = model.Forward(X_val, training=False)
+print("val accuracy:", model.compute_accuracy(preds, y_val))
+```
+
+### Example: text generation
+
+```python
+import numpy as np
+from Enilnets import TextGenerator, Tokenizer
+
+np.random.seed(0)
+corpus = "the quick brown fox jumps over the lazy dog. " * 50
+
+tokenizer = Tokenizer(vocab_size=128, level="char").fit([corpus])
+gen = TextGenerator(tokenizer, embed_dim=64, num_heads=4, num_layers=2, max_seq_len=64)
+gen.Train([corpus], epochs=10, batch_size=32, seq_len=32, verbose=True)
+
+print(gen.generate(prompt="the quick", max_new_tokens=50, temperature=0.8, top_p=0.9))
+print("perplexity:", gen.perplexity(corpus))
+```
+
+### Example: reinforcement learning
+
+REINFORCE on a toy one-step-memory task (reward is 1 if the chosen action
+matches the sign of the current state's first feature):
+
+```python
+import numpy as np
+from Enilnets import NeuralNet, compute_returns
+
+np.random.seed(0)
+state_dim, n_actions = 4, 2
+policy = NeuralNet(learning_rate=0.01, optimizer="adam")
+policy.add_dense(state_dim, 32, activation="relu")
+policy.add_dense(32, n_actions, activation="softmax")
+
+def run_episode():
+    states, actions, rewards = [], [], []
+    state = np.random.randn(state_dim)
+    for _ in range(20):
+        probs = policy.Forward(state, training=False)[0]
+        action = np.random.choice(n_actions, p=probs)
+        reward = 1.0 if (action == 0) == (state[0] > 0) else -1.0
+        states.append(state); actions.append(action); rewards.append(reward)
+        state = np.random.randn(state_dim)
+    return np.array(states), np.array(actions), np.array(rewards)
+
+for episode in range(200):
+    states, actions, rewards = run_episode()
+    returns = compute_returns(rewards, gamma=0.95)
+    policy.Reinforce(states, actions, returns, action_type="discrete")
+    if episode % 50 == 0:
+        print(f"episode {episode} - total reward: {rewards.sum():.1f}")
+```
+
+### Example: GAN
+
+```python
+import numpy as np
+from Enilnets import GAN
+
+np.random.seed(0)
+# Toy 2D "real" data: a ring of points
+theta = np.random.uniform(0, 2 * np.pi, 500)
+X_train = np.stack([np.cos(theta), np.sin(theta)], axis=1) + np.random.randn(500, 2) * 0.05
+
+gan = GAN(latent_dim=8, data_dim=2, generator_hidden=[32, 32], discriminator_hidden=[32, 32],
+          loss_type="wasserstein", learning_rate=0.0005, wgan_clip_value=0.01)
+
+gan.Train(X_train, epochs=30, batch_size=64, d_steps=3, g_steps=1, verbose=True)
+
+samples = gan.sample(10)
+print("generated samples:\n", samples)
+print("mode collapse score (0=collapsed, 1=diverse):", gan.mode_collapse_score())
+```
+
+### Example: diffusion
+
+```python
+import numpy as np
+from Enilnets import DiffusionModel
+
+np.random.seed(0)
+# Toy 2D "real" data: a noisy ring of points
+theta = np.random.uniform(0, 2 * np.pi, 500)
+X_train = np.stack([np.cos(theta), np.sin(theta)], axis=1) + np.random.randn(500, 2) * 0.05
+
+diffusion = DiffusionModel(data_shape=(2,), time_steps=20, beta_schedule="linear",
+                            beta_start=1e-4, beta_end=0.1, denoiser_hidden=[64, 64],
+                            learning_rate=0.002, use_ema=True)
+
+diffusion.Train(X_train, epochs=100, batch_size=64, verbose=True)
+
+samples = diffusion.sample(n_samples=10)
+print("sample radii (should trend toward 1.0, the ring's radius):")
+print(np.linalg.norm(samples, axis=1))
 ```
 
 ## Core concepts
