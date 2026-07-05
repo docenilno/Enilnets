@@ -1,0 +1,65 @@
+"""
+Classification evaluation utilities: confusion matrix and a per-class
+precision/recall/F1 report, generalizing train.py's binary-only
+compute_precision_recall_f1 to the multi-class case.
+"""
+import numpy as np
+
+
+def confusion_matrix(y_true, y_pred, num_classes=None):
+    """Return an (num_classes, num_classes) matrix where entry [i, j] counts
+    samples with true class i predicted as class j. y_true/y_pred: 1D
+    integer class-label arrays (use argmax first for one-hot/softmax output)."""
+    y_true = np.asarray(y_true).astype(np.int64)
+    y_pred = np.asarray(y_pred).astype(np.int64)
+    if num_classes is None:
+        num_classes = int(max(y_true.max(), y_pred.max())) + 1
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    np.add.at(cm, (y_true, y_pred), 1)
+    return cm
+
+
+def classification_report(y_true, y_pred, num_classes=None):
+    """Per-class precision/recall/f1/support plus macro and weighted averages.
+
+    Returns a dict: {class_idx: {precision, recall, f1, support}, ...,
+    "macro_avg": {...}, "weighted_avg": {...}, "accuracy": float}.
+    """
+    cm = confusion_matrix(y_true, y_pred, num_classes)
+    n_classes = cm.shape[0]
+    support = cm.sum(axis=1)
+    tp = np.diag(cm)
+    predicted_positives = cm.sum(axis=0)
+
+    precision = np.divide(tp, predicted_positives, out=np.zeros(n_classes, dtype=np.float64),
+                          where=predicted_positives != 0)
+    recall = np.divide(tp, support, out=np.zeros(n_classes, dtype=np.float64), where=support != 0)
+    f1_denom = precision + recall
+    f1 = np.divide(2 * precision * recall, f1_denom, out=np.zeros(n_classes, dtype=np.float64),
+                   where=f1_denom != 0)
+
+    report = {}
+    for c in range(n_classes):
+        report[c] = {
+            "precision": float(precision[c]),
+            "recall": float(recall[c]),
+            "f1": float(f1[c]),
+            "support": int(support[c]),
+        }
+
+    total_support = support.sum()
+    report["accuracy"] = float(tp.sum() / total_support) if total_support > 0 else 0.0
+    report["macro_avg"] = {
+        "precision": float(np.mean(precision)),
+        "recall": float(np.mean(recall)),
+        "f1": float(np.mean(f1)),
+        "support": int(total_support),
+    }
+    weights = support / total_support if total_support > 0 else np.zeros(n_classes)
+    report["weighted_avg"] = {
+        "precision": float(np.sum(precision * weights)),
+        "recall": float(np.sum(recall * weights)),
+        "f1": float(np.sum(f1 * weights)),
+        "support": int(total_support),
+    }
+    return report

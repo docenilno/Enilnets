@@ -3,28 +3,15 @@ from ..base import NeuralNet
 from .sampling import langevin_dynamics
 
 class EnergyBasedModel:
-    """
-    Energy-Based Model (EBM) built on Enilnets.
-    Learns an energy function E(x) such that low energy = high probability.
-    Uses contrastive divergence with Langevin dynamics for sampling.
-
-    Parameters
-    ----------
-    data_dim : int
-        Dimension of data
-    hidden_dims : list
-        Hidden layer sizes for energy network
-    activation : str
-    learning_rate : float
-    optimizer : str
-    l2_lambda : float
-    """
     def __init__(self, data_dim, hidden_dims=[512, 512], activation="swish",
-                 learning_rate=0.001, optimizer="adam", l2_lambda=0.0):
+                 learning_rate=0.001, optimizer="adam", l2_lambda=0.0,
+                 persistent_cd=True, persistent_buffer_size=1000,
+                 init_noise_scale=0.5):
         self.data_dim = data_dim
+        self.persistent_cd = persistent_cd
+        self.persistent_buffer_size = persistent_buffer_size
+        self.init_noise_scale = init_noise_scale
 
-        # Energy network: maps data -> scalar energy
-        # We use a network that outputs 1 value
         self.energy_net = NeuralNet(learning_rate=learning_rate, optimizer=optimizer, l2_lambda=l2_lambda)
         prev = data_dim
         for h in hidden_dims:
@@ -32,12 +19,11 @@ class EnergyBasedModel:
             prev = h
         self.energy_net.add_dense(prev, 1, activation="linear")
 
+        if self.persistent_cd:
+            self.persistent_buffer = np.random.randn(persistent_buffer_size, data_dim) * init_noise_scale
+            self.buffer_ptr = 0
+
     def energy(self, x):
-        """
-        Compute energy E(x). Lower energy = higher probability.
-        x: (batch, data_dim) or (batch, C, H, W)
-        Returns: (batch, 1)
-        """
         x = np.asarray(x, dtype=np.float64)
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
@@ -46,33 +32,48 @@ class EnergyBasedModel:
         return self.energy_net.Forward(x, training=True)
 
     def _energy_grad(self, x):
-        """
-        Compute gradient of energy w.r.t. x using finite differences.
-        Returns energy and gradient.
-        """
+        """Gradient of the scalar energy w.r.t. its input, via backprop."""
         x = np.asarray(x, dtype=np.float64)
         if x.ndim == 1:
             x = x.reshape(1, -1)
 
-        eps = 1e-4
-        grad = np.zeros_like(x)
         e = self.energy(x)
-
-        for i in range(x.shape[1]):
-            x_plus = x.copy()
-            x_plus[:, i] += eps
-            e_plus = self.energy(x_plus)
-            grad[:, i] = (e_plus - e)[:, 0] / eps
-
+        # Backprop with dL/de=1 per-sample to get d(energy)/dx as deltas[0]
+        self.energy_net.Backward(None, output_delta=np.ones((x.shape[0], 1)))
+        # The gradient of energy w.r.t input is in the first layer's delta
+        first_layer = self.energy_net.layers[0]
+        grad = np.dot(self.energy_net.deltas[0], first_layer["weights"])
         return e, grad
 
-    def train_step(self, x_data, n_cd_steps=10, step_size=0.1, noise_scale=0.005):
-        """
-        Contrastive divergence training step.
+    def _sample_negative(self, batch_size, n_cd_steps=10, step_size=0.1, noise_scale=0.005):
+        """Sample negative examples via Langevin dynamics, using persistent
+        contrastive divergence (PCD) if enabled."""
+        if self.persistent_cd:
+            # Initialize from persistent buffer
+            if batch_size <= self.persistent_buffer_size:
+                idx = np.random.choice(self.persistent_buffer_size, batch_size, replace=False)
+                x_neg = self.persistent_buffer[idx].copy()
+            else:
+                x_neg = self.persistent_buffer.copy()
+                # Supplement with random if needed
+                extra = batch_size - self.persistent_buffer_size
+                x_neg = np.concatenate([x_neg, np.random.randn(extra, self.data_dim) * self.init_noise_scale], axis=0)
+        else:
+            x_neg = np.random.randn(batch_size, self.data_dim) * self.init_noise_scale
 
-        1. Sample negative samples using Langevin dynamics starting from random noise
-        2. Push down energy on data, push up energy on samples
-        """
+        for _ in range(n_cd_steps):
+            e, grad = self._energy_grad(x_neg)
+            x_neg = x_neg - step_size * grad + np.random.randn(*x_neg.shape) * noise_scale
+
+        # Update persistent buffer
+        if self.persistent_cd:
+            n = min(batch_size, self.persistent_buffer_size)
+            self.persistent_buffer[self.buffer_ptr:self.buffer_ptr + n] = x_neg[:n]
+            self.buffer_ptr = (self.buffer_ptr + n) % self.persistent_buffer_size
+
+        return x_neg
+
+    def train_step(self, x_data, n_cd_steps=10, step_size=0.1, noise_scale=0.005):
         x_data = np.asarray(x_data, dtype=np.float64)
         if x_data.ndim > 2:
             x_data = x_data.reshape(x_data.shape[0], -1)
@@ -80,35 +81,24 @@ class EnergyBasedModel:
             x_data = x_data.reshape(1, -1)
         batch_size = x_data.shape[0]
 
-        # Generate negative samples via Langevin dynamics
-        x_neg = np.random.randn(*x_data.shape) * 0.5
-        for _ in range(n_cd_steps):
-            e, grad = self._energy_grad(x_neg)
-            x_neg = x_neg - step_size * grad + np.random.randn(*x_neg.shape) * noise_scale
+        # Sample negative examples
+        x_neg = self._sample_negative(batch_size, n_cd_steps, step_size, noise_scale)
 
-        # Energy on data and samples
         e_data = self.energy(x_data)
+        # Push down energy on data: dL/de_data = +1
+        self.energy_net.Backward(None, output_delta=np.ones((batch_size, 1)) / batch_size)
+        self.energy_net.update()
+
         e_neg = self.energy(x_neg)
+        # Push up energy on negatives: dL/de_neg = -1
+        self.energy_net.Backward(None, output_delta=-np.ones((batch_size, 1)) / batch_size)
+        self.energy_net.update()
 
-        # Loss: push down data energy, push up sample energy
-        # L = E(x_data) - E(x_neg)  (we want to minimize this)
         loss = float(np.mean(e_data - e_neg))
-
-        # Backward for data (gradient = +1, push down)
-        self.energy_net.Backward(np.ones((batch_size, 1)))
-        self.energy_net.update()
-
-        # Backward for negative samples (gradient = -1, push up)
-        self.energy_net.Backward(-np.ones((batch_size, 1)))
-        self.energy_net.update()
-
         return loss
 
     def Train(self, X_train, epochs=10, batch_size=64, n_cd_steps=10,
               step_size=0.1, noise_scale=0.005, verbose=True):
-        """
-        Train EBM with contrastive divergence.
-        """
         X = np.asarray(X_train, dtype=np.float64)
         if X.ndim > 2:
             X = X.reshape(X.shape[0], -1)
@@ -128,18 +118,12 @@ class EnergyBasedModel:
         return history
 
     def sample(self, n_samples=1, n_steps=100, step_size=0.1, noise_scale=0.005):
-        """
-        Generate samples using Langevin dynamics from random initialization.
-        """
-        x = np.random.randn(n_samples, self.data_dim) * 0.5
+        x = np.random.randn(n_samples, self.data_dim) * self.init_noise_scale
         for _ in range(n_steps):
             e, grad = self._energy_grad(x)
             x = x - step_size * grad + np.random.randn(*x.shape) * noise_scale
         return x
 
     def score(self, x):
-        """
-        Compute score function: -grad_x log p(x) = grad_x E(x)
-        """
         _, grad = self._energy_grad(x)
         return grad
