@@ -1,5 +1,5 @@
 import numpy as np
-from .forward import im2col
+from .forward import im2col, im2col1d
 
 # Which of each layer type's trainable params get weight decay (never biases,
 # never batchnorm/layernorm gamma/beta).
@@ -7,8 +7,10 @@ _WEIGHT_DECAY_PARAMS = {
     "dense": ("weights",),
     "sparse": ("weights",),
     "conv2d": ("weights",),
+    "conv1d": ("weights",),
     "embedding": ("weights",),
     "multihead_attention": ("Wq", "Wk", "Wv", "Wo"),
+    "cross_attention": ("Wq", "Wk", "Wv", "Wo"),
     "rnn": ("Wx", "Wh"),
     "lstm": ("Wx", "Wh"),
     "gru": ("Wx", "Wh"),
@@ -20,7 +22,7 @@ def compute_gradients(self):
     {param_name: grad_array} dicts, or None for layers with no trainable
     parameters. Call Backward() first so self.deltas is populated."""
     from .backward import (embedding_backward, multihead_attention_backward,
-                            rnn_backward, lstm_backward, gru_backward)
+                            cross_attention_backward, rnn_backward, lstm_backward, gru_backward)
     grads = [None] * len(self.layers)
     for l, layer in enumerate(self.layers):
         t = layer["type"]
@@ -39,11 +41,22 @@ def compute_gradients(self):
         elif t == "conv2d":
             K = layer["k"]
             stride = layer.get("stride", 1)
+            pad = layer.get("pad", 0)
             col = self.conv_cache[l] if l < len(self.conv_cache) and self.conv_cache[l] is not None \
-                else im2col(self.outputs[l], K, K, stride=stride)
+                else im2col(self.outputs[l], K, K, stride=stride, pad=pad)
             delta_flat = self.deltas[l].transpose(0, 2, 3, 1).reshape(-1, layer["weights"].shape[0])
             grad_w = np.dot(delta_flat.T, col).reshape(layer["weights"].shape)
             grad_b = np.sum(self.deltas[l], axis=(0, 2, 3))
+            grads[l] = {"weights": grad_w, "bias": grad_b}
+        elif t == "conv1d":
+            K = layer["k"]
+            stride = layer.get("stride", 1)
+            pad = layer.get("pad", 0)
+            col = self.conv_cache[l] if l < len(self.conv_cache) and self.conv_cache[l] is not None \
+                else im2col1d(self.outputs[l], K, stride=stride, pad=pad)
+            delta_flat = self.deltas[l].transpose(0, 2, 1).reshape(-1, layer["weights"].shape[0])
+            grad_w = np.dot(delta_flat.T, col).reshape(layer["weights"].shape)
+            grad_b = np.sum(self.deltas[l], axis=(0, 2))
             grads[l] = {"weights": grad_w, "bias": grad_b}
         elif t in ("batchnorm", "layernorm"):
             grad_gamma = layer.get("d_gamma", np.zeros_like(layer["gamma"]))
@@ -58,6 +71,11 @@ def compute_gradients(self):
             # when this layer has a preceding layer to propagate error to, so
             # recompute unconditionally here to also cover layer 0.
             multihead_attention_backward(self.deltas[l], layer, self.attention_cache[l])
+            grads[l] = {p: layer[f"d_{p}"] for p in ("Wq", "bq", "Wk", "bk", "Wv", "bv", "Wo", "bo")}
+        elif t == "cross_attention":
+            # Same rationale as multihead_attention above: recompute
+            # unconditionally to also cover this layer being index 0.
+            cross_attention_backward(self.deltas[l], layer, self.attention_cache[l])
             grads[l] = {p: layer[f"d_{p}"] for p in ("Wq", "bq", "Wk", "bk", "Wv", "bv", "Wo", "bo")}
         elif t in ("rnn", "lstm"):
             fn = rnn_backward if t == "rnn" else lstm_backward

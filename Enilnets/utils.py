@@ -112,3 +112,90 @@ class EarlyStopping:
             self.num_bad_epochs += 1
         self.should_stop = self.num_bad_epochs >= self.patience
         return self.should_stop
+
+
+class ModelCheckpoint:
+    """Train(..., callbacks=[...]) callback: snapshots the model's weights
+    (via get_weights(), not a full Save()) whenever the monitored metric
+    improves, mirroring EarlyStopping's own improvement logic. Call
+    .restore(model) after training to load the best snapshot back.
+
+    monitor: a key expected in the epoch's `logs` dict -- "loss"/
+        "accuracy"/"lr" always present, "val_loss"/"val_accuracy" only if
+        X_val/Y_val were given to Train(). Silently does nothing on an
+        epoch where `monitor` isn't present in `logs` (e.g. "val_loss"
+        requested but no validation data was given).
+    mode: "min" (e.g. loss) or "max" (e.g. accuracy).
+    """
+    def __init__(self, monitor="val_loss", mode="min", min_delta=0.0):
+        self.monitor = monitor
+        self.mode = mode
+        self.min_delta = min_delta
+        self.best = None
+        self.best_weights = None
+        self.best_epoch = None
+
+    def _is_improvement(self, metric):
+        if self.best is None:
+            return True
+        if self.mode == "min":
+            return metric < self.best - self.min_delta
+        return metric > self.best + self.min_delta
+
+    def on_epoch_end(self, epoch, logs, model=None):
+        if self.monitor not in logs:
+            return
+        metric = logs[self.monitor]
+        if self._is_improvement(metric):
+            self.best = metric
+            self.best_weights = model.get_weights()
+            self.best_epoch = epoch
+
+    def restore(self, model):
+        """Load the best snapshot's weights back into `model` (no-op if
+        no epoch ever improved, e.g. training never called on_epoch_end)."""
+        if self.best_weights is not None:
+            model.set_weights(self.best_weights)
+
+
+class CSVLogger:
+    """Train(..., callbacks=[...]) callback: appends one row per epoch to
+    a CSV file (NOT a single growing in-memory table written once at the
+    end), so an interrupted run leaves a valid, parseable partial log.
+    Column header is written on the first epoch based on that epoch's
+    `logs` keys."""
+    def __init__(self, path):
+        self.path = path
+        self._fieldnames = None
+
+    def on_epoch_end(self, epoch, logs, model=None):
+        import csv
+        row = {"epoch": epoch}
+        row.update({k: float(v) for k, v in logs.items()})
+        write_header = self._fieldnames is None
+        if write_header:
+            self._fieldnames = list(row.keys())
+        with open(self.path, "w" if write_header else "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+
+class JSONLogger:
+    """Train(..., callbacks=[...]) callback: appends one JSON object per
+    line (JSON-lines format -- NOT a single growing JSON array), so an
+    interrupted run leaves a valid, parseable partial log (each completed
+    line parses independently with json.loads)."""
+    def __init__(self, path):
+        self.path = path
+        self._opened = False
+
+    def on_epoch_end(self, epoch, logs, model=None):
+        import json
+        row = {"epoch": epoch}
+        row.update({k: float(v) for k, v in logs.items()})
+        mode = "w" if not self._opened else "a"
+        with open(self.path, mode) as f:
+            f.write(json.dumps(row) + "\n")
+        self._opened = True

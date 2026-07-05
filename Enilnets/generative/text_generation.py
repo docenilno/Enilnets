@@ -73,21 +73,41 @@ class TextGenerator:
         loss = -np.sum(one_hot * np.log(probs_clipped)) / n
         return float(loss)
 
-    def Train(self, texts, epochs=10, batch_size=32, seq_len=None, stride=1, verbose=True):
+    def Train(self, texts, epochs=10, batch_size=32, seq_len=None, stride=1, verbose=True,
+              callbacks=None):
+        """callbacks: optional list of duck-typed callback objects (same
+        convention as NeuralNet.Train's `callbacks`). Supported hooks:
+          on_batch_end(epoch, batch_idx, loss, model=self) -- after every
+            minibatch's train_step.
+          on_epoch_end(epoch, logs, model=self) -- once per epoch, with
+            logs={"loss": avg_loss}. `model=self` is this TextGenerator (not
+            the underlying NeuralNet), so `model.network`/`model.tokenizer`
+            are available for checkpointing/generation-sample callbacks.
+          on_train_end(history) -- once after the epoch loop.
+        Missing methods are skipped (no error). Use this (plus
+        `model.network.get_weights()`/`set_weights()` inside a callback) for
+        checkpointing/resuming a run instead of writing a manual training
+        loop from scratch."""
         X, y = self.prepare_sequences(texts, seq_len=seq_len, stride=stride)
         n_samples = X.shape[0]
         history = []
         for epoch in range(epochs):
             indices = np.random.permutation(n_samples)
             epoch_loss = 0.0
-            for start in range(0, n_samples, batch_size):
+            for batch_idx, start in enumerate(range(0, n_samples, batch_size)):
                 idx = indices[start:start + batch_size]
                 loss = self.train_step(X[idx], y[idx])
                 epoch_loss += loss * len(idx)
+                for cb in (callbacks or []):
+                    getattr(cb, "on_batch_end", lambda *a, **k: None)(epoch, batch_idx, loss, model=self)
             avg_loss = epoch_loss / n_samples
             history.append(avg_loss)
             if verbose:
                 print(f"Epoch {epoch+1}/{epochs} - loss: {avg_loss:.4f}")
+            for cb in (callbacks or []):
+                getattr(cb, "on_epoch_end", lambda *a, **k: None)(epoch, {"loss": avg_loss}, model=self)
+        for cb in (callbacks or []):
+            getattr(cb, "on_train_end", lambda *a, **k: None)(history)
         return history
 
     def _sample_token(self, probs, temperature=1.0, top_p=None, top_k=None, greedy=False):

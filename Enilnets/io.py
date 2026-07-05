@@ -68,6 +68,7 @@ def Save(self, file, save_opt_state=True, extra_state=None):
         "grad_accum": self._grad_accum,
         "last_width": self._last_width,
         "last_spatial": self._last_spatial,
+        "last_spatial_1d": self._last_spatial_1d,
         "residual_stack": self._residual_stack,
     }
     if save_opt_state:
@@ -150,6 +151,9 @@ def Load(self, file, load_opt_state=True):
     last_spatial = raw.get("last_spatial")
     if last_spatial is not None:
         self._last_spatial = tuple(last_spatial)
+    last_spatial_1d = raw.get("last_spatial_1d")
+    if last_spatial_1d is not None:
+        self._last_spatial_1d = tuple(last_spatial_1d)
     residual_stack = raw.get("residual_stack")
     if residual_stack is not None:
         self._residual_stack = list(residual_stack)

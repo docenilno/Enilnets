@@ -24,8 +24,31 @@ def ComputeLoss(self, output, target, function="mse", reduction="mean", **kwargs
     elif function in ("cross_entropy", "categorical_cross_entropy"):
         o = np.clip(o, eps, 1.0)
         loss = -t * np.log(o)
+        # Divide by every leading (non-class) dim -- batch_size*seq_len for
+        # (B,S,V) sequence output, not just batch_size (o.shape[0]), else the
+        # reported loss/gradient scale is off by a factor of seq_len.
+        n = int(np.prod(o.shape[:-1])) if o.ndim > 1 else o.shape[0]
         if reduction == "mean":
-            return float(np.sum(loss) / o.shape[0])
+            return float(np.sum(loss) / n)
+        if reduction == "sum":
+            return float(np.sum(loss))
+        return loss
+    elif function == "sparse_cross_entropy":
+        # Like cross_entropy but `target` is integer class indices (shape
+        # matching output.shape[:-1]) instead of a one-hot array -- avoids
+        # manually one-hotting large-vocab targets (e.g. language modeling).
+        o = np.clip(o, eps, 1.0)
+        idx = np.asarray(target).astype(np.int64)
+        if idx.shape != o.shape[:-1]:
+            raise ValueError(
+                f"sparse_cross_entropy target shape {idx.shape} must match "
+                f"output.shape[:-1] {o.shape[:-1]}"
+            )
+        picked = np.take_along_axis(o, idx[..., None], axis=-1)[..., 0]
+        loss = -np.log(picked)
+        n = int(np.prod(o.shape[:-1])) if o.ndim > 1 else o.shape[0]
+        if reduction == "mean":
+            return float(np.sum(loss) / n)
         if reduction == "sum":
             return float(np.sum(loss))
         return loss
@@ -38,8 +61,13 @@ def ComputeLoss(self, output, target, function="mse", reduction="mean", **kwargs
     elif function == "hinge":
         loss = np.maximum(0, 1 - t * o)
     elif function == "kl_divergence":
-        mu = kwargs.get("mu", o)
-        logvar = kwargs.get("logvar", t)
+        if "mu" not in kwargs or "logvar" not in kwargs:
+            raise ValueError(
+                "kl_divergence requires explicit 'mu' and 'logvar' kwargs "
+                "(it operates on VAE mu/logvar tensors, not output/target)."
+            )
+        mu = kwargs["mu"]
+        logvar = kwargs["logvar"]
         loss = -0.5 * np.sum(1 + logvar - mu**2 - np.exp(logvar), axis=-1)
     elif function == "bce_logits":
         loss = np.maximum(o, 0) - o * t + np.log(1 + np.exp(-np.abs(o)))

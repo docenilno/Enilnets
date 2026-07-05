@@ -47,6 +47,7 @@ import Enilnets.crossmodal_utils as cm_utils
 from Enilnets import (
     set_seed, train_test_split, iterate_minibatches, count_parameters,
     EarlyStopping, one_hot, constants,
+    ModelCheckpoint, CSVLogger, JSONLogger,
 )
 
 
@@ -698,6 +699,108 @@ class TestAttention(unittest.TestCase):
         W[i, j] = orig
         numeric = (loss_p - loss_m) / (2 * eps)
         self.assertAlmostEqual(numeric, layer["d_Wq"][i, j], delta=max(1e-4, abs(numeric) * 1e-3))
+
+
+class TestPositionalSchemes(unittest.TestCase):
+    """v3.1.0 Phase 8: positional_scheme="absolute"|"rope"|"alibi" on
+    add_multihead_attention."""
+
+    def _fd_check_param(self, model, X, Y, layer_idx, param_name, eps=1e-5, n_check=5):
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[layer_idx][param_name]
+        flat = model.layers[layer_idx][param_name].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig - eps
+            loss_m = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig
+            num_grad = (loss_p - loss_m) / (2 * eps)
+            max_err = max(max_err, abs(num_grad - analytic.reshape(-1)[idx]))
+        return max_err
+
+    def _build(self, scheme, causal):
+        model = NeuralNet(optimizer="sgd")
+        model.add_multihead_attention(embed_dim=8, num_heads=2, causal=causal, positional_scheme=scheme)
+        model._last_width = 8
+        model.add_dense(None, 3, activation="linear")
+        return model
+
+    def test_unknown_positional_scheme_raises(self):
+        with self.assertRaises(ValueError):
+            NeuralNet().add_multihead_attention(embed_dim=8, num_heads=2, positional_scheme="bogus")
+
+    def test_rope_requires_even_head_dim(self):
+        with self.assertRaises(ValueError):
+            # embed_dim=12, num_heads=4 -> head_dim=3 (odd).
+            NeuralNet().add_multihead_attention(embed_dim=12, num_heads=4, positional_scheme="rope")
+
+    def test_absolute_matches_default_no_positional_scheme_arg(self):
+        # Regression safety: positional_scheme defaults to "absolute" and
+        # must reproduce the exact prior (pre-Phase-8) output/gradients --
+        # trivially true by construction (Qh_scored=Qh, Kh_scored=Kh, no
+        # bias added) but pinned here as an explicit regression test.
+        np.random.seed(0)
+        x = np.random.randn(1, 5, 8)
+        m1 = NeuralNet()
+        m1.add_multihead_attention(embed_dim=8, num_heads=2, causal=True)
+        m2 = NeuralNet()
+        m2.add_multihead_attention(embed_dim=8, num_heads=2, causal=True, positional_scheme="absolute")
+        for k in ("Wq", "bq", "Wk", "bk", "Wv", "bv", "Wo", "bo"):
+            m2.layers[0][k] = m1.layers[0][k].copy()
+        out1 = m1.Forward(x, training=True)
+        out2 = m2.Forward(x, training=True)
+        self.assertTrue(np.allclose(out1, out2))
+
+    def test_fd_gradients_all_schemes(self):
+        np.random.seed(0)
+        for scheme in ("absolute", "rope", "alibi"):
+            for causal in (False, True):
+                model = self._build(scheme, causal)
+                X = np.random.randn(2, 5, 8)
+                Y = np.random.randn(2, 5, 3)
+                for pname in ("Wq", "Wk", "Wv", "Wo"):
+                    err = self._fd_check_param(model, X, Y, 0, pname)
+                    self.assertLess(err, 1e-6, f"scheme={scheme} causal={causal} param={pname}")
+
+    def test_rope_changes_attention_output_vs_absolute(self):
+        np.random.seed(0)
+        x = np.random.randn(1, 6, 8)
+        m_abs = NeuralNet()
+        m_abs.add_multihead_attention(embed_dim=8, num_heads=2, positional_scheme="absolute")
+        np.random.seed(1)
+        m_rope = NeuralNet()
+        m_rope.add_multihead_attention(embed_dim=8, num_heads=2, positional_scheme="rope")
+        # Give both models identical weights so any output difference is
+        # purely due to RoPE's rotation, not random init.
+        for k in ("Wq", "bq", "Wk", "bk", "Wv", "bv", "Wo", "bo"):
+            m_rope.layers[0][k] = m_abs.layers[0][k].copy()
+        out_abs = m_abs.Forward(x, training=False)
+        out_rope = m_rope.Forward(x, training=False)
+        self.assertFalse(np.allclose(out_abs, out_rope))
+
+    def test_alibi_biases_nearby_tokens_more_than_far_ones(self):
+        # A single-head, all-else-equal check: ALiBi's bias should make an
+        # otherwise-uniform attention distribution favor nearby positions.
+        np.random.seed(0)
+        model = NeuralNet()
+        model.add_multihead_attention(embed_dim=4, num_heads=1, positional_scheme="alibi")
+        layer = model.layers[0]
+        for k in ("Wq", "Wk", "Wv"):
+            layer[k] = np.zeros_like(layer[k])  # Q=K=V=0 -> raw scores are all 0 before ALiBi bias
+        layer["Wo"] = np.eye(4)
+        x = np.zeros((1, 5, 4))
+        out = model.Forward(x, training=False)
+        attn = model.attention_cache[0][6]  # (B, H, S, S)
+        # Row for the last position: attention should be highest for the
+        # closest (most recent) key and monotonically decrease with distance.
+        last_row = attn[0, 0, -1]
+        self.assertTrue(np.all(np.diff(last_row) > 0))  # increasing toward the closest position
 
 
 class TestTextGenerator(unittest.TestCase):
@@ -1386,6 +1489,55 @@ class TestDiffusion(unittest.TestCase):
         out = self.diff.denoise(x_noisy, t_start=10, t_end=0)
         self.assertEqual(out.shape, (2, 16))
 
+    def test_sample_ddim_shape_across_step_counts(self):
+        for n_steps in (5, 10, 25):
+            samples = self.diff.sample_ddim(n_samples=3, n_steps=n_steps, shape=(16,))
+            self.assertEqual(samples.shape, (3, 16))
+
+    def test_sample_ddim_fewer_forward_passes_than_full_sample(self):
+        calls = {"n": 0}
+        orig = self.diff._predict_noise
+        def counting_predict_noise(*args, **kwargs):
+            calls["n"] += 1
+            return orig(*args, **kwargs)
+        self.diff._predict_noise = counting_predict_noise
+        try:
+            self.diff.sample_ddim(n_samples=2, n_steps=10, shape=(16,))
+            ddim_calls = calls["n"]
+            calls["n"] = 0
+            self.diff.sample(n_samples=2, shape=(16,))
+            full_calls = calls["n"]
+        finally:
+            self.diff._predict_noise = orig
+        self.assertEqual(ddim_calls, 10)
+        self.assertEqual(full_calls, self.diff.time_steps)
+        self.assertLess(ddim_calls, full_calls)
+
+    def test_sample_ddim_deterministic_when_eta_zero(self):
+        np.random.seed(7)
+        s1 = self.diff.sample_ddim(n_samples=2, n_steps=10, eta=0.0, shape=(16,))
+        np.random.seed(7)
+        s2 = self.diff.sample_ddim(n_samples=2, n_steps=10, eta=0.0, shape=(16,))
+        self.assertTrue(np.allclose(s1, s2))
+
+    def test_sample_ddim_stochastic_when_eta_one(self):
+        np.random.seed(0)
+        s1 = self.diff.sample_ddim(n_samples=2, n_steps=10, eta=1.0, shape=(16,))
+        s2 = self.diff.sample_ddim(n_samples=2, n_steps=10, eta=1.0, shape=(16,))
+        self.assertFalse(np.allclose(s1, s2))
+
+    def test_sample_ddim_quality_on_ring_dataset(self):
+        np.random.seed(0)
+        diff = DiffusionModel(data_shape=(2,), time_steps=100, beta_schedule="linear",
+                              denoiser_hidden=[32, 32], learning_rate=0.02, use_ema=False)
+        theta = np.random.uniform(0, 2 * np.pi, 300)
+        X = np.stack([np.cos(theta), np.sin(theta)], axis=1) + np.random.randn(300, 2) * 0.05
+        for _ in range(150):
+            diff.train_step(X)
+        samples = diff.sample_ddim(n_samples=50, n_steps=20, shape=(2,))
+        radii = np.linalg.norm(samples, axis=1)
+        self.assertLess(abs(radii.mean() - 1.0), 0.5)
+
     def test_ema_variant(self):
         diff_ema = DiffusionModel(
             data_shape=(16,), time_steps=20, denoiser_type="mlp",
@@ -1393,6 +1545,115 @@ class TestDiffusion(unittest.TestCase):
         )
         loss = diff_ema.train_step(self.X)
         self.assertIsInstance(loss, float)
+
+    def test_train_step_loss_decreases_after_shared_backward_refactor(self):
+        # Regression test for Phase 3's refactor of train_step to use the
+        # shared _manual_sequential_backward helper instead of a hand-rolled
+        # duplicate backward loop -- training loss curve must still decrease.
+        np.random.seed(0)
+        diff = DiffusionModel(data_shape=(4,), time_steps=20, denoiser_hidden=[16],
+                             learning_rate=0.02, use_ema=False)
+        X = np.random.randn(30, 4) * 0.5
+        losses = [diff.train_step(X) for _ in range(60)]
+        self.assertLess(np.mean(losses[-10:]), np.mean(losses[:10]))
+
+
+class TestClassConditionalGeneration(unittest.TestCase):
+    """v3.1.0 Phase 11: num_classes=None (default, unconditional, backward
+    compatible) + labels/y threaded through train/generate for VAE, GAN,
+    and DiffusionModel. Each trained on a tiny synthetic 3-class blob
+    dataset with well-separated centers; generated samples per class must
+    land near that class's real center, not a different one."""
+
+    def _make_blobs(self, n_per_class=80, seed=0):
+        rng = np.random.RandomState(seed)
+        centers = np.array([[-3.0, -3.0], [3.0, 3.0], [3.0, -3.0]])
+        X, y = [], []
+        for c in range(3):
+            X.append(centers[c] + rng.randn(n_per_class, 2) * 0.4)
+            y.append(np.full(n_per_class, c))
+        return np.concatenate(X, axis=0), np.concatenate(y, axis=0), centers
+
+    def test_vae_class_conditional_generation(self):
+        np.random.seed(0)
+        X, y, centers = self._make_blobs()
+        X_scaled = (X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0))  # VAE decoder is sigmoid
+        vae = VAE(input_dim=2, latent_dim=4, encoder_hidden=[32], decoder_hidden=[32],
+                 learning_rate=0.01, optimizer="adam", num_classes=3)
+        vae.Train(X_scaled, epochs=60, batch_size=60, y_train=y, verbose=False)
+        for c in range(3):
+            samples = vae.generate(n_samples=30, y=c)
+            target = (centers[c] - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0))
+            self.assertLess(np.linalg.norm(samples.mean(axis=0) - target), 0.3)
+
+    def test_gan_class_conditional_generation(self):
+        np.random.seed(0)
+        X, y, centers = self._make_blobs()
+        scale = np.abs(X).max()
+        X_scaled = X / scale  # generator is tanh
+        gan = GAN(latent_dim=4, data_dim=2, generator_hidden=[32, 32], discriminator_hidden=[32, 32],
+                 learning_rate=0.001, num_classes=3)
+        gan.Train(X_scaled, epochs=60, batch_size=60, y_train=y, verbose=False)
+        for c in range(3):
+            samples = gan.sample(n_samples=50, y=c)
+            target = centers[c] / scale
+            self.assertLess(np.linalg.norm(samples.mean(axis=0) - target), 0.6)
+
+    def test_diffusion_class_conditional_generation(self):
+        np.random.seed(0)
+        X, y, centers = self._make_blobs()
+        scale = np.abs(X).max()
+        X_scaled = X / scale
+        diff = DiffusionModel(data_shape=(2,), time_steps=100, denoiser_hidden=[32, 32],
+                              learning_rate=0.01, use_ema=False, num_classes=3)
+        for _ in range(250):
+            idx = np.random.choice(len(X_scaled), 60, replace=False)
+            diff.train_step(X_scaled[idx], y=y[idx])
+        for c in range(3):
+            samples = diff.sample_ddim(n_samples=30, n_steps=20, y=c)
+            target = centers[c] / scale
+            self.assertLess(np.linalg.norm(samples.mean(axis=0) - target), 0.6)
+
+    def test_vae_validates_labels_both_directions(self):
+        vae_cond = VAE(input_dim=2, latent_dim=2, num_classes=3)
+        with self.assertRaises(ValueError):
+            vae_cond.generate(n_samples=2)  # num_classes set, y missing
+        vae_uncond = VAE(input_dim=2, latent_dim=2)
+        with self.assertRaises(ValueError):
+            vae_uncond.generate(n_samples=2, y=0)  # unconditional, y given
+
+    def test_gan_validates_labels_both_directions(self):
+        gan_cond = GAN(latent_dim=2, data_dim=2, num_classes=3)
+        with self.assertRaises(ValueError):
+            gan_cond.generate(2)
+        gan_uncond = GAN(latent_dim=2, data_dim=2)
+        with self.assertRaises(ValueError):
+            gan_uncond.generate(2, y=0)
+
+    def test_diffusion_validates_labels_both_directions(self):
+        diff_cond = DiffusionModel(data_shape=(2,), time_steps=10, num_classes=3)
+        with self.assertRaises(ValueError):
+            diff_cond.train_step(np.random.randn(4, 2))
+        diff_uncond = DiffusionModel(data_shape=(2,), time_steps=10)
+        with self.assertRaises(ValueError):
+            diff_uncond.train_step(np.random.randn(4, 2), y=np.zeros(4, dtype=int))
+
+    def test_unconditional_models_still_work_unchanged(self):
+        # Regression: num_classes=None (default) must be fully
+        # backward-compatible with the pre-Phase-11 unconditional API.
+        np.random.seed(0)
+        vae = VAE(input_dim=4, latent_dim=2, encoder_hidden=[8], decoder_hidden=[8])
+        X = np.random.rand(10, 4)
+        vae.Train(X, epochs=2, batch_size=10, verbose=False)
+        self.assertEqual(vae.generate(n_samples=3).shape, (3, 4))
+
+        gan = GAN(latent_dim=2, data_dim=4, generator_hidden=[8], discriminator_hidden=[8])
+        gan.Train(X, epochs=1, batch_size=10, d_steps=1, g_steps=1, verbose=False)
+        self.assertEqual(gan.sample(3).shape, (3, 4))
+
+        diff = DiffusionModel(data_shape=(4,), time_steps=10, denoiser_hidden=[8])
+        diff.train_step(X)
+        self.assertEqual(diff.sample(n_samples=3).shape, (3, 4))
 
 
 class TestAutoregressive(unittest.TestCase):
@@ -1549,6 +1810,134 @@ class TestUNet(unittest.TestCase):
         params = unet.get_params()
         self.assertIsInstance(params, list)
         self.assertGreater(len(params), 0)
+
+
+class TestUNetDenoiser(unittest.TestCase):
+    """v3.1.0 Phase 3: UNetDenoiser real backward + k=3 same-padding convs.
+
+    Non-negotiable per the project's QA bar: finite-difference gradient
+    checks on a SMALL U-Net across every subnetwork (encoder, decoder,
+    bottleneck, time_net) before trusting anything larger -- this is
+    exactly the class of bug (an off-by-one/convention mismatch) that has
+    bitten this project before (the residual-connection gradient routing).
+    """
+
+    def _fd_check(self, unet, x, t, target, net, param_name, layer_idx, eps=1e-5, n_check=4):
+        def loss_fn():
+            return float(np.mean((unet.forward(x, t) - target) ** 2))
+        out = unet.forward(x, t)
+        grad_out = 2 * (out - target) / out.size
+        unet.backward(grad_out)
+        analytic = net.compute_gradients()[layer_idx][param_name]
+        flat = net.layers[layer_idx][param_name].reshape(-1)
+        rng = np.random.RandomState(5)
+        idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            loss_p = loss_fn()
+            flat[idx] = orig - eps
+            loss_m = loss_fn()
+            flat[idx] = orig
+            num_grad = (loss_p - loss_m) / (2 * eps)
+            max_err = max(max_err, abs(num_grad - analytic.reshape(-1)[idx]))
+        return max_err
+
+    def test_conv_layers_use_k3_same_padding(self):
+        unet = UNetDenoiser(in_ch=1, base_ch=4, time_emb_dim=4, ch_mult=(1, 2))
+        for net in unet.get_params():
+            for layer in net.layers:
+                if layer["type"] == "conv2d":
+                    self.assertEqual(layer["k"], 3)
+                    self.assertEqual(layer["padding"], "same")
+
+    def test_fd_gradients_small_unet_two_levels(self):
+        np.random.seed(0)
+        unet = UNetDenoiser(in_ch=1, base_ch=4, time_emb_dim=8, ch_mult=(1, 2))
+        x = np.random.randn(2, 1, 8, 8)
+        t = np.array([3, 100])
+        target = np.random.randn(2, 1, 8, 8)
+        for net, pname, lidx in [
+            (unet.encoders[0], "weights", 0),
+            (unet.encoders[1], "weights", 1),
+            (unet.bottleneck, "weights", 0),
+            (unet.decoders[0], "weights", 0),
+            (unet.decoders[1], "weights", 1),
+            (unet.out_net, "weights", 0),
+        ]:
+            self.assertLess(self._fd_check(unet, x, t, target, net, pname, lidx), 1e-6)
+
+    def test_fd_gradients_time_embedding_path(self):
+        # time_emb_dim*4 == base_ch*ch_mult[0] so _add_time_to_feature
+        # actually triggers (channel-count match), exercising time_net's
+        # gradient path (otherwise silently skipped -- see forward()).
+        np.random.seed(1)
+        unet = UNetDenoiser(in_ch=1, base_ch=8, time_emb_dim=2, ch_mult=(1, 2))
+        x = np.random.randn(2, 1, 8, 8)
+        t = np.array([3, 100])
+        target = np.random.randn(2, 1, 8, 8)
+        self.assertLess(self._fd_check(unet, x, t, target, unet.time_net, "weights", 0), 1e-6)
+        self.assertLess(self._fd_check(unet, x, t, target, unet.encoders[0], "weights", 0), 1e-6)
+
+    def test_fd_gradients_three_level_unet(self):
+        np.random.seed(2)
+        unet = UNetDenoiser(in_ch=2, base_ch=4, time_emb_dim=6, ch_mult=(1, 2, 4))
+        x = np.random.randn(2, 2, 16, 16)
+        t = np.array([0, 500])
+        target = np.random.randn(2, 2, 16, 16)
+        for net, pname, lidx in [
+            (unet.encoders[2], "weights", 0),  # deepest encoder
+            (unet.decoders[0], "bias", 1),     # deepest decoder
+            (unet.decoders[2], "weights", 1),  # shallowest decoder
+        ]:
+            self.assertLess(self._fd_check(unet, x, t, target, net, pname, lidx), 1e-6)
+
+    def test_fd_gradients_single_level_unet(self):
+        # levels=1: no downsample/upsample ever triggers -- edge case.
+        np.random.seed(3)
+        unet = UNetDenoiser(in_ch=1, base_ch=4, time_emb_dim=4, ch_mult=(1,))
+        x = np.random.randn(2, 1, 6, 6)
+        t = np.array([1, 2])
+        target = np.random.randn(2, 1, 6, 6)
+        for net, pname, lidx in [
+            (unet.encoders[0], "weights", 0),
+            (unet.bottleneck, "weights", 1),
+            (unet.decoders[0], "weights", 0),
+        ]:
+            self.assertLess(self._fd_check(unet, x, t, target, net, pname, lidx), 1e-6)
+
+    def test_fd_gradients_identity_downsample_edge_case(self):
+        # Spatial size smaller than pool_factor -- _downsample is an
+        # identity no-op; backward must match that.
+        np.random.seed(4)
+        unet = UNetDenoiser(in_ch=1, base_ch=4, time_emb_dim=4, ch_mult=(1, 2), pool_factor=2)
+        x = np.random.randn(2, 1, 1, 1)
+        t = np.array([1, 2])
+        target = np.random.randn(2, 1, 1, 1)
+        self.assertLess(self._fd_check(unet, x, t, target, unet.encoders[1], "weights", 0), 1e-6)
+
+    def test_train_step_loss_decreases(self):
+        np.random.seed(0)
+        unet = UNetDenoiser(in_ch=1, base_ch=8, time_emb_dim=16, ch_mult=(1, 2),
+                            time_steps=50, learning_rate=0.01)
+        X = np.random.randn(20, 1, 8, 8) * 0.5
+        losses = [unet.train_step(X) for _ in range(40)]
+        self.assertLess(np.mean(losses[-10:]), np.mean(losses[:10]))
+
+    def test_train_runs_and_returns_history(self):
+        np.random.seed(0)
+        unet = UNetDenoiser(in_ch=1, base_ch=4, time_emb_dim=8, ch_mult=(1,), time_steps=20)
+        X = np.random.randn(12, 1, 6, 6)
+        history = unet.Train(X, epochs=2, batch_size=6, verbose=False)
+        self.assertEqual(len(history), 2)
+        self.assertTrue(all(isinstance(l, float) for l in history))
+
+    def test_sample_shape(self):
+        np.random.seed(0)
+        unet = UNetDenoiser(in_ch=1, base_ch=4, time_emb_dim=8, ch_mult=(1,), time_steps=10)
+        samples = unet.sample(n_samples=3, shape=(1, 6, 6))
+        self.assertEqual(samples.shape, (3, 1, 6, 6))
 
 
 class TestSamplingUtilities(unittest.TestCase):
@@ -1847,6 +2236,98 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(np.array_equal(oh, np.eye(3)[[0, 2, 1]]))
 
 
+class TestCheckpointingAndLogging(unittest.TestCase):
+    """v3.1.0 Phase 10: ModelCheckpoint/CSVLogger/JSONLogger -- Train(...,
+    callbacks=[...]) callbacks built on Phase 9's generic callback system."""
+
+    def test_model_checkpoint_manufactured_non_monotonic_loss(self):
+        ckpt = ModelCheckpoint(monitor="loss", mode="min")
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(2, 2, activation="linear")
+        losses = [1.0, 0.5, 0.7, 0.3, 0.9]  # best is epoch 3 (0.3)
+        for epoch, loss in enumerate(losses):
+            model.layers[0]["weights"] = np.full((2, 2), epoch, dtype=np.float64)
+            ckpt.on_epoch_end(epoch, {"loss": loss}, model=model)
+        self.assertEqual(ckpt.best_epoch, 3)
+        self.assertEqual(ckpt.best, 0.3)
+        self.assertTrue(np.allclose(ckpt.best_weights[0]["weights"], 3))
+
+    def test_model_checkpoint_restore(self):
+        ckpt = ModelCheckpoint(monitor="loss", mode="min")
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(2, 2, activation="linear")
+        model.layers[0]["weights"] = np.ones((2, 2))
+        ckpt.on_epoch_end(0, {"loss": 1.0}, model=model)
+        model.layers[0]["weights"] = np.full((2, 2), 5.0)  # worse epoch, weights drift
+        ckpt.on_epoch_end(1, {"loss": 2.0}, model=model)
+        ckpt.restore(model)
+        self.assertTrue(np.allclose(model.layers[0]["weights"], 1.0))
+
+    def test_model_checkpoint_missing_monitor_key_is_noop(self):
+        ckpt = ModelCheckpoint(monitor="val_loss", mode="min")
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(2, 2, activation="linear")
+        ckpt.on_epoch_end(0, {"loss": 1.0}, model=model)  # no "val_loss" key
+        self.assertIsNone(ckpt.best)
+        self.assertIsNone(ckpt.best_weights)
+
+    def test_model_checkpoint_e2e_via_train(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd", learning_rate=0.1)
+        model.add_dense(4, 8, activation="relu")
+        model.add_dense(8, 2, activation="softmax")
+        X = np.random.randn(30, 4)
+        Y = np.eye(2)[np.random.randint(0, 2, 30)]
+        ckpt = ModelCheckpoint(monitor="val_loss", mode="min")
+        history = model.Train(X, Y, epochs=6, batch_size=30, X_val=X[:10], Y_val=Y[:10],
+                              loss_function="cross_entropy", verbose=False, callbacks=[ckpt])
+        self.assertEqual(ckpt.best, min(history["val_loss"]))
+
+    def test_csv_logger_writes_valid_partial_log_if_interrupted(self):
+        import tempfile, os, csv
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log.csv")
+            logger = CSVLogger(path)
+            for epoch in range(3):  # simulate a crash after 3 epochs
+                logger.on_epoch_end(epoch, {"loss": 1.0 - epoch * 0.1}, model=None)
+            with open(path) as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(rows[0]["epoch"], "0")
+            self.assertAlmostEqual(float(rows[2]["loss"]), 0.8)
+
+    def test_json_logger_writes_valid_partial_log_if_interrupted(self):
+        import tempfile, os, json
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log.jsonl")
+            logger = JSONLogger(path)
+            for epoch in range(3):
+                logger.on_epoch_end(epoch, {"loss": 1.0 - epoch * 0.1}, model=None)
+            with open(path) as f:
+                lines = [json.loads(l) for l in f]
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(lines[0]["epoch"], 0)
+            self.assertAlmostEqual(lines[2]["loss"], 0.8)
+
+    def test_loggers_e2e_via_train(self):
+        import tempfile, os, csv, json
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd", learning_rate=0.1)
+        model.add_dense(4, 8, activation="relu")
+        model.add_dense(8, 2, activation="softmax")
+        X = np.random.randn(20, 4)
+        Y = np.eye(2)[np.random.randint(0, 2, 20)]
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "log.csv")
+            json_path = os.path.join(d, "log.jsonl")
+            model.Train(X, Y, epochs=4, batch_size=20, loss_function="cross_entropy",
+                       verbose=False, callbacks=[CSVLogger(csv_path), JSONLogger(json_path)])
+            with open(csv_path) as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 4)
+            with open(json_path) as f:
+                self.assertEqual(len([json.loads(l) for l in f]), 4)
+
+
 # ========================================================================
 # Auto Shape Inference & Layer-Creation Ergonomics
 # ========================================================================
@@ -2135,6 +2616,108 @@ class TestAudioUtils(unittest.TestCase):
             os.remove(path)
 
 
+class TestDatasets(unittest.TestCase):
+    """v3.1.0 Phase 13: local-file dataset loaders (datasets.py). Real
+    downloaded MNIST/CIFAR-10 files may not be present in this environment,
+    so these tests hand-construct tiny fake files matching the real byte
+    layout and confirm the loaders parse them back exactly. A manual check
+    against real downloaded files is recommended if/when available."""
+
+    def test_load_mnist_roundtrip(self):
+        import struct
+        import tempfile
+        import os
+        from Enilnets.datasets import load_mnist
+
+        with tempfile.TemporaryDirectory() as d:
+            N, R, C = 6, 4, 4
+            rng = np.random.RandomState(0)
+            img_data = rng.randint(0, 256, size=(N, R, C)).astype(np.uint8)
+            lbl_data = rng.randint(0, 10, size=(N,)).astype(np.uint8)
+
+            images_path = os.path.join(d, "images-idx3-ubyte")
+            labels_path = os.path.join(d, "labels-idx1-ubyte")
+            with open(images_path, "wb") as f:
+                f.write(struct.pack(">IIII", 2051, N, R, C))
+                f.write(img_data.tobytes())
+            with open(labels_path, "wb") as f:
+                f.write(struct.pack(">II", 2049, N))
+                f.write(lbl_data.tobytes())
+
+            X, y = load_mnist(images_path, labels_path)
+            self.assertEqual(X.shape, (N, 1, R, C))
+            self.assertTrue(np.array_equal(X[:, 0], img_data.astype(np.float64)))
+            self.assertTrue(np.array_equal(y, lbl_data.astype(np.int64)))
+
+            X_norm, _ = load_mnist(images_path, labels_path, normalize=True)
+            self.assertLessEqual(X_norm.max(), 1.0)
+            self.assertTrue(np.allclose(X_norm * 255.0, X))
+
+    def test_load_mnist_bad_magic_raises(self):
+        import struct
+        import tempfile
+        import os
+        from Enilnets.datasets import load_mnist
+
+        with tempfile.TemporaryDirectory() as d:
+            images_path = os.path.join(d, "images-idx3-ubyte")
+            labels_path = os.path.join(d, "labels-idx1-ubyte")
+            with open(images_path, "wb") as f:
+                f.write(struct.pack(">IIII", 9999, 1, 2, 2))
+                f.write(bytes(4))
+            with open(labels_path, "wb") as f:
+                f.write(struct.pack(">II", 2049, 1))
+                f.write(bytes(1))
+            with self.assertRaises(ValueError):
+                load_mnist(images_path, labels_path)
+
+    def test_load_cifar10_roundtrip(self):
+        import pickle
+        import tempfile
+        import os
+        from Enilnets.datasets import load_cifar10
+
+        with tempfile.TemporaryDirectory() as d:
+            n = 5
+            rng = np.random.RandomState(1)
+            data = rng.randint(0, 256, size=(n, 3072)).astype(np.uint8)
+            labels = list(rng.randint(0, 10, size=n))
+            batch = {b"data": data, b"labels": labels}
+            batch_path = os.path.join(d, "data_batch_1")
+            with open(batch_path, "wb") as f:
+                pickle.dump(batch, f)
+
+            X, y = load_cifar10(batch_path)
+            self.assertEqual(X.shape, (n, 3, 32, 32))
+            self.assertTrue(np.array_equal(X, data.reshape(n, 3, 32, 32).astype(np.float64)))
+            self.assertTrue(np.array_equal(y, np.array(labels)))
+
+            X_norm, _ = load_cifar10(batch_path, normalize=True)
+            self.assertLessEqual(X_norm.max(), 1.0)
+
+    def test_load_cifar10_concatenates_multiple_batches(self):
+        import pickle
+        import tempfile
+        import os
+        from Enilnets.datasets import load_cifar10
+
+        with tempfile.TemporaryDirectory() as d:
+            n = 3
+            rng = np.random.RandomState(2)
+            paths = []
+            for i in range(2):
+                data = rng.randint(0, 256, size=(n, 3072)).astype(np.uint8)
+                labels = list(rng.randint(0, 10, size=n))
+                path = os.path.join(d, f"data_batch_{i+1}")
+                with open(path, "wb") as f:
+                    pickle.dump({b"data": data, b"labels": labels}, f)
+                paths.append(path)
+
+            X, y = load_cifar10(paths)
+            self.assertEqual(X.shape, (2 * n, 3, 32, 32))
+            self.assertEqual(y.shape, (2 * n,))
+
+
 class TestTextUtils(unittest.TestCase):
     def test_tokenizer_fit_encode_decode(self):
         texts = ["hello world", "foo bar baz", "testing one two three"]
@@ -2358,6 +2941,321 @@ class TestResidualConnections(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.add_residual_end()
 
+    def test_regression_residual_target_with_nonlinear_activation(self):
+        # Regression test for a latent bug found while building Phase 5's
+        # shared deferral infrastructure: when the residual skip's target
+        # layer (the one immediately before add_residual_start()) has a
+        # non-linear activation, the deferred gradient was being added
+        # directly to that layer's PRE-activation delta slot without first
+        # passing through the activation's derivative -- a units mismatch
+        # masked in every in-repo transformer block (whose residual targets
+        # are always non-dense layer types) but real for exactly the
+        # custom-ResNet-block usage the README documents and encourages.
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(4, 4, activation="tanh")  # residual target -- non-linear
+        model.add_residual_start()
+        model.add_dense(4, 4, activation="tanh")
+        model.add_dense(4, 4, activation="linear")
+        model.add_residual_end()
+        model.add_dense(4, 3, activation="linear")
+        X = np.random.randn(2, 4)
+        Y = np.random.randn(2, 3)
+
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[0]["weights"]
+
+        def loss_fn():
+            return model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+
+        eps = 1e-5
+        flat = model.layers[0]["weights"].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=6, replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            lp = loss_fn()
+            flat[idx] = orig - eps
+            lm = loss_fn()
+            flat[idx] = orig
+            num = (lp - lm) / (2 * eps)
+            max_err = max(max_err, abs(num - analytic.reshape(-1)[idx]))
+        self.assertLess(max_err, 1e-6)
+
+
+class TestMultiSourceLayers(unittest.TestCase):
+    """v3.1.0 Phase 5: shared "goto"/"concat_at"/"reverse_sequence" layer
+    infrastructure (used internally by cross-attention and bidirectional
+    RNN). The indexing convention here is deliberately direct -- a
+    stored/source index names "the layer whose OUTPUT is referenced", NO
+    -1 adjustment (unlike residual's save_index, which points AT the
+    residual_save marker layer and needs -1) -- this is the single
+    highest-risk correctness point flagged in the plan, so it gets its own
+    explicit index-correctness test before anything else consumes it."""
+
+    def test_goto_index_correctness_forward_and_backward(self):
+        # The critical convention test: goto's stored_index must target the
+        # NAMED layer directly, not the layer at stored_index-1 (a mistake
+        # that would silently point one layer too early, copy-pasting
+        # residual's -1 offset into new code that doesn't need it).
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(4, 4, activation="tanh")   # layer 0
+        model.add_dense(4, 4, activation="tanh")   # layer 1 -- becomes a dead end
+        model.add_dense(4, 4, activation="tanh")   # layer 2 -- becomes a dead end
+        model.layers.append({"type": "goto", "stored_index": 0})  # layer 3
+        model.add_dense(4, 3, activation="linear")  # layer 4
+
+        X = np.random.randn(2, 4)
+        Y = np.random.randn(2, 3)
+        model.Forward(X, training=True)
+
+        # Forward: goto's output must be exactly layer0's output, not
+        # layer1's or layer2's.
+        self.assertTrue(np.allclose(model.outputs[4], model.outputs[1]))
+        self.assertFalse(np.allclose(model.outputs[4], model.outputs[2]))
+        self.assertFalse(np.allclose(model.outputs[4], model.outputs[3]))
+
+        # Backward: layer0 gets the real (nonzero) gradient routed through
+        # goto; layers 1 and 2 are dead ends and must get exactly zero.
+        model.Backward(Y, loss_function="mse")
+        grads = model.compute_gradients()
+        self.assertTrue(np.allclose(grads[1]["weights"], 0))
+        self.assertTrue(np.allclose(grads[2]["weights"], 0))
+        self.assertFalse(np.allclose(grads[0]["weights"], 0))
+
+    def test_goto_targets_the_named_layer_not_an_off_by_one_neighbor(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(4, 4, activation="tanh")
+        model.add_dense(4, 4, activation="tanh")
+        model.add_dense(4, 4, activation="tanh")
+        model.layers.append({"type": "goto", "stored_index": 1})
+        model.add_dense(4, 3, activation="linear")
+        X = np.random.randn(2, 4)
+        model.Forward(X, training=True)
+        self.assertTrue(np.allclose(model.outputs[4], model.outputs[2]))
+        self.assertFalse(np.allclose(model.outputs[4], model.outputs[1]))
+
+    def test_goto_fd_gradient_dense_target(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(4, 4, activation="tanh")
+        model.add_dense(4, 4, activation="tanh")
+        model.add_dense(4, 4, activation="tanh")
+        model.layers.append({"type": "goto", "stored_index": 0})
+        model.add_dense(4, 3, activation="linear")
+        X = np.random.randn(2, 4)
+        Y = np.random.randn(2, 3)
+
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[0]["weights"]
+
+        def loss_fn():
+            return model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+
+        eps = 1e-5
+        flat = model.layers[0]["weights"].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=6, replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            lp = loss_fn()
+            flat[idx] = orig - eps
+            lm = loss_fn()
+            flat[idx] = orig
+            num = (lp - lm) / (2 * eps)
+            max_err = max(max_err, abs(num - analytic.reshape(-1)[idx]))
+        self.assertLess(max_err, 1e-6)
+
+    def test_concat_at_forward_shape_and_fd_gradients(self):
+        np.random.seed(1)
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(4, 4, activation="tanh")   # layer 0: shared source
+        model.add_dense(4, 3, activation="tanh")   # layer 1: branch A
+        model.layers.append({"type": "goto", "stored_index": 0})  # layer 2
+        model.add_dense(4, 5, activation="tanh")   # layer 3: branch B
+        model.layers.append({"type": "concat_at", "idx_a": 1, "idx_b": 3})  # layer 4
+        model.add_dense(8, 2, activation="linear")  # layer 5
+
+        X = np.random.randn(2, 4)
+        Y = np.random.randn(2, 2)
+        model.Forward(X, training=True)
+        self.assertEqual(model.outputs[5].shape, (2, 8))
+        self.assertTrue(np.array_equal(model.outputs[5][:, :3], model.outputs[2]))
+        self.assertTrue(np.array_equal(model.outputs[5][:, 3:], model.outputs[4]))
+
+        def fd_check(layer_idx, pname):
+            model.Forward(X, training=True)
+            model.Backward(Y, loss_function="mse")
+            analytic = model.compute_gradients()[layer_idx][pname]
+            def loss_fn():
+                return model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            eps = 1e-5
+            flat = model.layers[layer_idx][pname].reshape(-1)
+            rng = np.random.RandomState(2)
+            idxs = rng.choice(flat.size, size=min(6, flat.size), replace=False)
+            max_err = 0.0
+            for idx in idxs:
+                orig = flat[idx]
+                flat[idx] = orig + eps
+                lp = loss_fn()
+                flat[idx] = orig - eps
+                lm = loss_fn()
+                flat[idx] = orig
+                num = (lp - lm) / (2 * eps)
+                max_err = max(max_err, abs(num - analytic.reshape(-1)[idx]))
+            return max_err
+
+        self.assertLess(fd_check(0, "weights"), 1e-6)  # shared source
+        self.assertLess(fd_check(1, "weights"), 1e-6)  # branch A
+        self.assertLess(fd_check(3, "weights"), 1e-6)  # branch B
+        self.assertLess(fd_check(5, "weights"), 1e-6)  # post-concat
+
+    def test_reverse_sequence_forward_is_time_reversed(self):
+        model = NeuralNet()
+        model.add_lstm(3, 4, return_sequences=True)
+        model.layers.append({"type": "reverse_sequence"})
+        X = np.random.randn(2, 5, 3)
+        model.Forward(X, training=True)
+        self.assertTrue(np.allclose(model.outputs[2], model.outputs[1][:, ::-1, :]))
+
+    def test_reverse_sequence_fd_gradient_through_lstm(self):
+        np.random.seed(2)
+        model = NeuralNet(optimizer="sgd")
+        model.add_lstm(3, 4, return_sequences=True)
+        model.layers.append({"type": "reverse_sequence"})
+        model.add_dense(4, 2, activation="linear")
+        X = np.random.randn(2, 5, 3)
+        Y = np.random.randn(2, 5, 2)
+
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[0]["Wx"]
+
+        def loss_fn():
+            return model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+
+        eps = 1e-5
+        flat = model.layers[0]["Wx"].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=6, replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            lp = loss_fn()
+            flat[idx] = orig - eps
+            lm = loss_fn()
+            flat[idx] = orig
+            num = (lp - lm) / (2 * eps)
+            max_err = max(max_err, abs(num - analytic.reshape(-1)[idx]))
+        self.assertLess(max_err, 1e-6)
+
+
+class TestCrossAttention(unittest.TestCase):
+    """v3.1.0 Phase 6: add_cross_attention -- encoder-decoder style
+    attention where Q comes from the normal sequential x and K/V come from
+    an earlier layer's output (kv_source_index), built on Phase 5's direct
+    (no -1 offset) indexing convention."""
+
+    def _build_encoder_decoder_toy(self):
+        # shared source -> {encoder branch (KV source), decoder branch (Q)}
+        # -> cross_attention -> output, mirroring an encoder-decoder split.
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(6, 8, activation="tanh")   # layer 0: shared source
+        model.add_dense(8, 8, activation="tanh")   # layer 1: encoder repr (KV source)
+        model.layers.append({"type": "goto", "stored_index": 0})  # layer 2
+        model.add_dense(8, 8, activation="tanh")   # layer 3: decoder query stream
+        model.add_cross_attention(kv_source_index=1, embed_dim=8, num_heads=2)  # layer 4
+        model.add_dense(8, 3, activation="linear")  # layer 5
+        B, S = 2, 4
+        X = np.random.randn(B, S, 6)
+        Y = np.random.randn(B, S, 3)
+        return model, X, Y
+
+    def _fd_check(self, model, X, Y, layer_idx, pname, eps=1e-5, n_check=6):
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[layer_idx][pname]
+        def loss_fn():
+            return model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+        flat = model.layers[layer_idx][pname].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            lp = loss_fn()
+            flat[idx] = orig - eps
+            lm = loss_fn()
+            flat[idx] = orig
+            num = (lp - lm) / (2 * eps)
+            max_err = max(max_err, abs(num - analytic.reshape(-1)[idx]))
+        return max_err
+
+    def test_forward_shape_and_uses_kv_source_not_sequential_predecessor(self):
+        model, X, Y = self._build_encoder_decoder_toy()
+        model.Forward(X, training=True)
+        self.assertEqual(model.outputs[-1].shape, (2, 4, 3))
+        # Cross-attention's own K/V really came from layer 1 (encoder),
+        # not layer 3 (its own sequential predecessor) -- perturb layer 1's
+        # weights and confirm cross-attention's output changes.
+        out_before = model.outputs[5].copy()  # cross_attention (layer 4) own output
+        model.layers[1]["weights"] += 0.5
+        out_after = model.Forward(X, training=True)
+        self.assertFalse(np.allclose(out_before, model.outputs[5]))
+
+    def test_fd_gradients_q_path(self):
+        # (a) Wq/bq via Q's path.
+        model, X, Y = self._build_encoder_decoder_toy()
+        for pname in ("Wq", "bq"):
+            self.assertLess(self._fd_check(model, X, Y, 4, pname), 1e-6)
+
+    def test_fd_gradients_kv_source_path(self):
+        # (b) Wk/bk/Wv/bv via the KV-source path.
+        model, X, Y = self._build_encoder_decoder_toy()
+        for pname in ("Wk", "bk", "Wv", "bv", "Wo", "bo"):
+            self.assertLess(self._fd_check(model, X, Y, 4, pname), 1e-6)
+
+    def test_fd_gradients_flow_into_both_branches(self):
+        model, X, Y = self._build_encoder_decoder_toy()
+        self.assertLess(self._fd_check(model, X, Y, 0, "weights"), 1e-6)  # shared source
+        self.assertLess(self._fd_check(model, X, Y, 1, "weights"), 1e-6)  # encoder branch
+        self.assertLess(self._fd_check(model, X, Y, 3, "weights"), 1e-6)  # decoder branch
+
+    def test_e2e_kv_source_weight_change_moves_the_loss(self):
+        # (c) a weight change in the KV-source branch must move the loss
+        # through cross-attention.
+        model, X, Y = self._build_encoder_decoder_toy()
+        loss_before = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+        model.layers[1]["weights"] += 0.1
+        loss_after = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+        self.assertNotEqual(loss_before, loss_after)
+
+    def test_cross_attention_as_last_layer_edge_case(self):
+        # Cross-attention as the network's very last layer -- exercises the
+        # dedicated last-layer deferral path in Backward().
+        np.random.seed(1)
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(4, 8, activation="tanh")
+        model.add_dense(8, 8, activation="tanh")  # layer 1: KV source
+        model.layers.append({"type": "goto", "stored_index": 0})
+        model.add_dense(8, 8, activation="tanh")  # layer 3: query stream
+        model.add_cross_attention(kv_source_index=1, embed_dim=8, num_heads=2)  # layer 4, last
+        X = np.random.randn(2, 3, 4)
+        Y = np.random.randn(2, 3, 8)
+        self.assertLess(self._fd_check(model, X, Y, 4, "Wk"), 1e-6)
+        self.assertLess(self._fd_check(model, X, Y, 1, "weights"), 1e-6)
+
 
 class TestRecurrentLayers(unittest.TestCase):
     """add_rnn/add_lstm/add_gru -- full BPTT verified via finite difference
@@ -2470,6 +3368,145 @@ class TestRecurrentLayers(unittest.TestCase):
         model.add_dense(10, 6, activation="relu")
         model.add_lstm(hidden_dim=4)
         self.assertEqual(model.layers[1]["n_in"], 6)
+
+
+class TestBidirectionalRNN(unittest.TestCase):
+    """v3.1.0 Phase 7: add_bidirectional_rnn/_lstm/_gru -- a thin
+    composition of Phase 5's goto/reverse_sequence/concat_at primitives
+    around the existing add_rnn/add_lstm/add_gru."""
+
+    def _fd_check(self, model, X, Y, layer_idx, pname, eps=1e-5, n_check=6):
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[layer_idx][pname]
+        def loss_fn():
+            return model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+        flat = model.layers[layer_idx][pname].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            lp = loss_fn()
+            flat[idx] = orig - eps
+            lm = loss_fn()
+            flat[idx] = orig
+            num = (lp - lm) / (2 * eps)
+            max_err = max(max_err, abs(num - analytic.reshape(-1)[idx]))
+        return max_err
+
+    def test_forward_shape_and_composition_return_sequences_true(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_bidirectional_lstm(n_in=4, hidden_dim=5, return_sequences=True)
+        model.add_dense(10, 3, activation="linear")
+        X = np.random.randn(2, 6, 4)
+        model.Forward(X, training=True)
+        self.assertEqual(model.outputs[-1].shape, (2, 6, 3))
+
+        # layers: 0 lstm(fwd), 1 goto, 2 reverse_sequence, 3 lstm(bwd),
+        # 4 reverse_sequence(un-reverse), 5 concat_at, 6 dense
+        concat_out = model.outputs[6]
+        self.assertTrue(np.allclose(concat_out[..., :5], model.outputs[1]))
+        self.assertTrue(np.allclose(concat_out[..., 5:], model.outputs[5]))
+        # backward direction really did see the time-reversed input: its
+        # raw (pre-un-reverse) output, reversed again, is the un-reversed one.
+        self.assertTrue(np.allclose(model.outputs[4][:, ::-1, :], model.outputs[5]))
+
+    def test_forward_shape_return_sequences_false(self):
+        np.random.seed(1)
+        model = NeuralNet(optimizer="sgd")
+        model.add_bidirectional_gru(n_in=3, hidden_dim=4, return_sequences=False)
+        model.add_dense(8, 2, activation="linear")
+        X = np.random.randn(2, 5, 3)
+        model.Forward(X, training=True)
+        self.assertEqual(model.outputs[-1].shape, (2, 2))
+        # no un-reversing needed for return_sequences=False -- confirm the
+        # layer sequence doesn't insert a second reverse_sequence.
+        types = [l["type"] for l in model.layers]
+        self.assertEqual(types.count("reverse_sequence"), 1)
+
+    def test_fd_gradients_lstm_both_directions(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_bidirectional_lstm(n_in=4, hidden_dim=5, return_sequences=True)
+        model.add_dense(10, 3, activation="linear")
+        X = np.random.randn(2, 6, 4)
+        Y = np.random.randn(2, 6, 3)
+        self.assertLess(self._fd_check(model, X, Y, 0, "Wx"), 1e-6)  # forward direction
+        self.assertLess(self._fd_check(model, X, Y, 3, "Wx"), 1e-6)  # backward direction
+        self.assertLess(self._fd_check(model, X, Y, 0, "Wh"), 1e-6)
+        self.assertLess(self._fd_check(model, X, Y, 6, "weights"), 1e-6)  # post-concat dense
+
+    def test_fd_gradients_rnn_and_gru(self):
+        np.random.seed(2)
+        model_rnn = NeuralNet(optimizer="sgd")
+        model_rnn.add_bidirectional_rnn(n_in=3, hidden_dim=4, return_sequences=True)
+        model_rnn.add_dense(8, 2, activation="linear")
+        X = np.random.randn(2, 4, 3)
+        Y = np.random.randn(2, 4, 2)
+        self.assertLess(self._fd_check(model_rnn, X, Y, 0, "Wx"), 1e-6)
+        self.assertLess(self._fd_check(model_rnn, X, Y, 3, "Wx"), 1e-6)
+
+        np.random.seed(1)
+        model_gru = NeuralNet(optimizer="sgd")
+        model_gru.add_bidirectional_gru(n_in=3, hidden_dim=4, return_sequences=False)
+        model_gru.add_dense(8, 2, activation="linear")
+        X2 = np.random.randn(2, 5, 3)
+        Y2 = np.random.randn(2, 2)
+        self.assertLess(self._fd_check(model_gru, X2, Y2, 0, "Wx"), 1e-6)
+        self.assertLess(self._fd_check(model_gru, X2, Y2, 3, "Wx"), 1e-6)
+
+    def test_bidirectional_as_first_layer_negative_goto_index(self):
+        # When add_bidirectional_* is the very first thing added,
+        # source_index = len(self.layers) - 1 = -1 -- exercises the
+        # negative-index guard added in Phase 5/6.
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_bidirectional_lstm(n_in=3, hidden_dim=4, return_sequences=True)
+        model.add_dense(8, 2, activation="linear")
+        self.assertEqual(model.layers[1]["stored_index"], -1)
+        X = np.random.randn(2, 4, 3)
+        Y = np.random.randn(2, 4, 2)
+        self.assertLess(self._fd_check(model, X, Y, 0, "Wx"), 1e-6)
+        self.assertLess(self._fd_check(model, X, Y, 3, "Wx"), 1e-6)
+
+    def test_bidirectional_solves_backward_in_time_task_unidirectional_does_not(self):
+        # Functional test: label(t) depends on x(t+1) (a FUTURE value) --
+        # solvable only by looking backward-in-time, not by a plain
+        # forward-only unidirectional RNN.
+        def make_batch(n, seq_len=6, seed=0):
+            rng = np.random.RandomState(seed)
+            X = rng.randn(n, seq_len, 1)
+            Y = np.zeros((n, seq_len, 1))
+            Y[:, :-1, 0] = (X[:, 1:, 0] > 0).astype(np.float64)
+            Y[:, -1, 0] = 0.5
+            return X, Y
+
+        X, Y = make_batch(150, seed=0)
+        Xv, Yv = make_batch(40, seed=1)
+
+        np.random.seed(0)
+        uni = NeuralNet(optimizer="adam", learning_rate=0.02)
+        uni.add_lstm(1, 8, return_sequences=True)
+        uni.add_dense(8, 1, activation="sigmoid")
+        for _ in range(120):
+            uni.TrainBatch(X, Y, loss_function="binary_cross_entropy")
+        uni_pred = uni.Forward(Xv, training=False)
+        uni_acc = np.mean(((uni_pred > 0.5).astype(float) == Yv)[:, :-1])
+
+        np.random.seed(0)
+        bi = NeuralNet(optimizer="adam", learning_rate=0.02)
+        bi.add_bidirectional_lstm(1, 8, return_sequences=True)
+        bi.add_dense(16, 1, activation="sigmoid")
+        for _ in range(120):
+            bi.TrainBatch(X, Y, loss_function="binary_cross_entropy")
+        bi_pred = bi.Forward(Xv, training=False)
+        bi_acc = np.mean(((bi_pred > 0.5).astype(float) == Yv)[:, :-1])
+
+        self.assertLess(uni_acc, 0.65)   # unidirectional: at/near chance
+        self.assertGreater(bi_acc, 0.9)  # bidirectional: actually solves it
 
 
 class TestOptimizerFeatures(unittest.TestCase):
@@ -2895,6 +3932,470 @@ class TestVisualization(unittest.TestCase):
             snapshots.append(model.plot(sample_input=X[:1]))
         self.assertEqual(len(snapshots), 3)
         self.assertTrue(all(s.startswith("<svg") for s in snapshots))
+
+
+class TestV31Phase1Fixes(unittest.TestCase):
+    """v3.1.0 Phase 1 fixes + the extra bug-list fixes from real-world usage
+    (sparse_cross_entropy, strict optimizer/activation validation)."""
+
+    def test_sparse_cross_entropy_matches_onehot_cross_entropy(self):
+        np.random.seed(0)
+        model = NeuralNet()
+        out = np.array([[0.7, 0.2, 0.1], [0.1, 0.2, 0.7]])
+        idx = np.array([0, 2])
+        onehot = np.eye(3)[idx]
+        sparse_val = model.ComputeLoss(out, idx, function="sparse_cross_entropy")
+        dense_val = model.ComputeLoss(out, onehot, function="cross_entropy")
+        self.assertAlmostEqual(sparse_val, dense_val, places=10)
+
+    def test_cross_entropy_reduction_scales_with_seq_len_not_just_batch(self):
+        # Regression test for the reported bug: (B,S,V) sequence output's
+        # cross_entropy loss must divide by B*S, not just B, else it comes
+        # out ~S times too large.
+        model = NeuralNet()
+        B, S, V = 2, 8, 5
+        np.random.seed(0)
+        probs = np.random.dirichlet(np.ones(V), size=(B, S))
+        idx = np.random.randint(0, V, size=(B, S))
+        onehot = np.eye(V)[idx]
+        val = model.ComputeLoss(probs, onehot, function="cross_entropy")
+        expected = -np.sum(onehot * np.log(np.clip(probs, 1e-12, 1.0))) / (B * S)
+        self.assertAlmostEqual(val, expected, places=10)
+
+    def test_sparse_cross_entropy_backward_matches_onehot_backward(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd", learning_rate=0.0)
+        model.add_dense(4, 3, activation="softmax")
+        X = np.random.randn(5, 4)
+        idx = np.array([0, 1, 2, 1, 0])
+        onehot = np.eye(3)[idx]
+
+        model.Forward(X, training=True)
+        model.Backward(idx, loss_function="sparse_cross_entropy")
+        sparse_delta = model.deltas[-1].copy()
+
+        model.Forward(X, training=True)
+        model.Backward(onehot, loss_function="cross_entropy")
+        dense_delta = model.deltas[-1].copy()
+
+        self.assertTrue(np.allclose(sparse_delta, dense_delta))
+
+    def test_sparse_cross_entropy_trains_e2e(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="adam", learning_rate=0.05)
+        model.add_dense(4, 8, activation="relu")
+        model.add_dense(8, 3, activation="softmax")
+        X = np.random.randn(30, 4)
+        idx = (X[:, 0] > 0).astype(int) + (X[:, 1] > 0).astype(int)
+        losses = []
+        for _ in range(20):
+            loss, _ = model.TrainBatch(X, idx, loss_function="sparse_cross_entropy")
+            losses.append(loss)
+        self.assertLess(losses[-1], losses[0])
+
+    def test_unknown_optimizer_raises(self):
+        with self.assertRaises(ValueError):
+            NeuralNet(optimizer="adamw_typo")
+
+    def test_unknown_activation_raises(self):
+        model = NeuralNet(optimizer="sgd")
+        model.add_dense(3, 2, activation="realu")
+        with self.assertRaises(ValueError):
+            model.Forward(np.random.randn(2, 3), training=False)
+
+    def test_kl_divergence_requires_mu_logvar(self):
+        model = NeuralNet()
+        with self.assertRaises(ValueError):
+            model.ComputeLoss(np.zeros((2, 2)), np.zeros((2, 2)), function="kl_divergence")
+
+    def test_lr_scheduler_plateau_drops_after_patience(self):
+        sched = LRScheduler(1.0, mode="plateau", factor=0.5, patience=2, metric_mode="min")
+        metrics = [None, 1.0, 0.9, 0.9, 0.9, 0.9]
+        lrs = [sched.step(e, metric=m) for e, m in enumerate(metrics)]
+        # improves at epoch 1 (1.0), then plateaus for epochs 2,3 (patience=2)
+        # -> drop takes effect starting the step *after* the 2nd bad epoch.
+        self.assertEqual(lrs[0], 1.0)
+        self.assertLess(lrs[-1], 1.0)
+        self.assertAlmostEqual(lrs[-1], 0.5, places=10)
+
+    def test_train_lr_scheduler_plateau_e2e(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd", learning_rate=0.1)
+        model.add_dense(4, 2, activation="softmax")
+        X = np.random.randn(20, 4)
+        Y = np.eye(2)[np.random.randint(0, 2, 20)]
+        sched = LRScheduler(0.1, mode="plateau", factor=0.5, patience=1, metric_mode="min")
+        history = model.Train(X, Y, epochs=5, batch_size=20, scheduler=sched,
+                              loss_function="cross_entropy", verbose=False)
+        self.assertEqual(len(history["lr"]), 5)
+
+    def test_ppo_value_network_trains(self):
+        np.random.seed(0)
+        policy = NeuralNet(optimizer="adam", learning_rate=0.01)
+        policy.add_dense(4, 8, activation="relu")
+        policy.add_dense(8, 2, activation="softmax")
+        value_net = NeuralNet(optimizer="adam", learning_rate=0.05)
+        value_net.add_dense(4, 8, activation="relu")
+        value_net.add_dense(8, 1, activation="linear")
+
+        states = np.random.randn(16, 4)
+        actions = np.random.randint(0, 2, 16)
+        old_log_probs = np.log(np.full((16, 1), 0.5))
+        advantages = np.random.randn(16, 1)
+        value_targets = np.random.randn(16, 1) * 5
+
+        before = value_net.layers[0]["weights"].copy()
+        losses = []
+        for _ in range(10):
+            preds_before = value_net.Forward(states, training=False)
+            mse_before = float(np.mean((preds_before - value_targets) ** 2))
+            policy.PPO(states, actions, old_log_probs, advantages,
+                      value_targets=value_targets, value_network=value_net)
+            preds_after = value_net.Forward(states, training=False)
+            mse_after = float(np.mean((preds_after - value_targets) ** 2))
+            losses.append((mse_before, mse_after))
+        self.assertFalse(np.allclose(before, value_net.layers[0]["weights"]))
+        self.assertLess(losses[-1][1], losses[0][0])
+
+    def test_multimodal_fusion_attention_is_sample_dependent(self):
+        np.random.seed(0)
+        N, D = 6, 4
+        a = np.random.randn(N, D) * 0.1
+        b = np.random.randn(N, D) * 0.1
+        # Modality 'c' is an outlier only for half the samples.
+        c = a.copy()
+        c[: N // 2] += 10.0
+        fused = cm_utils.multimodal_fusion([a, b, c], fusion_type="attention")
+        self.assertEqual(fused.shape, (N, D))
+        gated = cm_utils.multimodal_fusion([a, b, c], fusion_type="gated")
+        # Attention weighting differs sample-to-sample (unlike gated's static
+        # weights), so it shouldn't collapse to the same per-sample result.
+        self.assertFalse(np.allclose(fused, gated))
+
+    def test_vgg_loss_fallback_and_custom_extractor(self):
+        from Enilnets.generative.generative_loss import vgg_loss
+        x = np.random.randn(2, 3)
+        y = np.random.randn(2, 3)
+        fallback = vgg_loss(x, y)
+        self.assertAlmostEqual(fallback, float(np.mean((x - y) ** 2)))
+        custom = vgg_loss(x, y, vgg_features=lambda a: a * 2)
+        self.assertNotAlmostEqual(custom, fallback)
+
+    def test_train_callbacks_fire(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd", learning_rate=0.05)
+        model.add_dense(3, 2, activation="softmax")
+        X = np.random.randn(10, 3)
+        Y = np.eye(2)[np.random.randint(0, 2, 10)]
+
+        class Recorder:
+            def __init__(self):
+                self.epoch_ends = 0
+                self.train_ends = 0
+            def on_epoch_end(self, epoch, logs, model=None):
+                self.epoch_ends += 1
+                assert "loss" in logs and model is not None
+            def on_train_end(self, history):
+                self.train_ends += 1
+
+        class Incomplete:
+            pass  # missing on_epoch_end -- must not crash
+
+        rec = Recorder()
+        model.Train(X, Y, epochs=3, batch_size=10, loss_function="cross_entropy",
+                   verbose=False, callbacks=[rec, Incomplete()])
+        self.assertEqual(rec.epoch_ends, 3)
+        self.assertEqual(rec.train_ends, 1)
+
+    def test_text_generator_train_callbacks_fire(self):
+        np.random.seed(0)
+        corpus = "the quick brown fox jumps over the lazy dog. " * 20
+        tok = Tokenizer(vocab_size=64, level="char").fit([corpus])
+        gen = TextGenerator(tok, embed_dim=16, num_heads=2, num_layers=1, max_seq_len=32)
+
+        class Recorder:
+            def __init__(self):
+                self.batches = 0
+                self.epochs = 0
+            def on_batch_end(self, epoch, batch_idx, loss, model=None):
+                self.batches += 1
+            def on_epoch_end(self, epoch, logs, model=None):
+                self.epochs += 1
+
+        rec = Recorder()
+        gen.Train([corpus], epochs=2, batch_size=16, seq_len=16, verbose=False,
+                 callbacks=[rec])
+        self.assertEqual(rec.epochs, 2)
+        self.assertGreater(rec.batches, 0)
+
+
+class TestV31Phase2ConvPadding(unittest.TestCase):
+    """v3.1.0 Phase 2: padding="same" for add_conv2d."""
+
+    def _fd_check_param(self, model, X, Y, layer_idx, param_name, eps=1e-5, n_check=6):
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[layer_idx][param_name]
+        flat = model.layers[layer_idx][param_name].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig - eps
+            loss_m = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig
+            num_grad = (loss_p - loss_m) / (2 * eps)
+            max_err = max(max_err, abs(num_grad - analytic.reshape(-1)[idx]))
+        return max_err
+
+    def _build_same_padded_net(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="sgd")
+        model.add_conv2d(in_ch=2, out_ch=3, k=3, activation="tanh", input_size=(6, 6), padding="same")
+        model.add_flatten()
+        model.add_dense(None, 4, activation="linear")
+        X = np.random.randn(2, 2, 6, 6)
+        Y = np.random.randn(2, 4)
+        return model, X, Y
+
+    def test_same_padding_preserves_spatial_size(self):
+        model = NeuralNet()
+        model.add_conv2d(in_ch=2, out_ch=4, k=3, input_size=(8, 8), padding="same")
+        self.assertEqual(model._last_spatial, (4, 8, 8))
+        model.add_conv2d(out_ch=5, k=5, padding="same")
+        self.assertEqual(model._last_spatial, (5, 8, 8))
+
+    def test_valid_padding_shrinks_spatial_size_unchanged_from_before(self):
+        model = NeuralNet()
+        model.add_conv2d(in_ch=2, out_ch=4, k=3, input_size=(8, 8))  # default padding="valid"
+        self.assertEqual(model._last_spatial, (4, 6, 6))
+
+    def test_same_padding_weight_and_bias_gradients(self):
+        model, X, Y = self._build_same_padded_net()
+        self.assertLess(self._fd_check_param(model, X, Y, 0, "weights"), 1e-6)
+        self.assertLess(self._fd_check_param(model, X, Y, 0, "bias"), 1e-6)
+
+    def test_same_padding_input_gradient(self):
+        np.random.seed(1)
+        X = np.random.randn(2, 2, 6, 6)
+        Y = np.random.randn(2, 4)
+        model = NeuralNet(optimizer="sgd")
+        # An identity 1x1 conv first so deltas[0] equals the gradient w.r.t.
+        # the raw input X (needed to finite-difference it directly).
+        model.add_conv2d(in_ch=2, out_ch=2, k=1, activation="linear", input_size=(6, 6))
+        model.layers[0]["weights"] = np.eye(2).reshape(2, 2, 1, 1)
+        model.layers[0]["bias"] = np.zeros(2)
+        model.add_conv2d(out_ch=3, k=3, activation="tanh", padding="same")
+        model.add_flatten()
+        model.add_dense(None, 4, activation="linear")
+
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        dx = model.deltas[0].copy()
+
+        eps = 1e-5
+        flat = X.reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=8, replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig - eps
+            loss_m = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig
+            num_grad = (loss_p - loss_m) / (2 * eps)
+            max_err = max(max_err, abs(num_grad - dx.reshape(-1)[idx]))
+        self.assertLess(max_err, 1e-6)
+
+    def test_valid_padding_byte_identical_to_pre_phase2(self):
+        # padding="valid" (default) must reproduce pre-Phase-2 output exactly
+        # on a fixed seed -- no behavior change for existing models.
+        np.random.seed(42)
+        model = NeuralNet(optimizer="sgd")
+        model.add_conv2d(in_ch=2, out_ch=3, k=3, activation="relu", input_size=(8, 8))
+        model.add_flatten()
+        model.add_dense(None, 4, activation="linear")
+        X = np.random.randn(2, 2, 8, 8)
+        out = model.Forward(X, training=False)
+        self.assertEqual(out.shape, (2, 4))
+        self.assertTrue(np.all(np.isfinite(out)))
+        self.assertEqual(model.layers[0]["pad"], 0)
+
+    def test_same_padding_requires_stride_1_and_odd_k(self):
+        with self.assertRaises(ValueError):
+            NeuralNet().add_conv2d(in_ch=1, out_ch=2, k=3, stride=2, padding="same", input_size=(6, 6))
+        with self.assertRaises(ValueError):
+            NeuralNet().add_conv2d(in_ch=1, out_ch=2, k=4, padding="same", input_size=(6, 6))
+
+    def test_unknown_padding_raises(self):
+        with self.assertRaises(ValueError):
+            NeuralNet().add_conv2d(in_ch=1, out_ch=2, k=3, padding="full", input_size=(6, 6))
+
+    def test_same_padding_trains_e2e(self):
+        model, X, Y = self._build_same_padded_net()
+        losses = []
+        for _ in range(15):
+            loss, _ = model.TrainBatch(X, Y, loss_function="mse")
+            losses.append(loss)
+        self.assertLess(losses[-1], losses[0])
+
+    def test_build_vgg16_feature_extractor_shapes_and_weights(self):
+        from Enilnets.generative.pretrained import build_vgg16_feature_extractor
+        np.random.seed(0)
+        model = build_vgg16_feature_extractor(up_to_block=2, input_ch=3)
+        x = np.random.randn(2, 3, 32, 32)
+        out = model.Forward(x, training=False)
+        self.assertEqual(out.shape, (2, 128, 8, 8))  # 2 pools: 32 -> 16 -> 8
+
+        # Standard VGG16 shape check on the canonical 224x224 input.
+        full = build_vgg16_feature_extractor(up_to_block=5, input_ch=3)
+        out_full = full.Forward(np.random.randn(1, 3, 224, 224), training=False)
+        self.assertEqual(out_full.shape, (1, 512, 7, 7))
+
+        weights = model.get_weights()
+        model2 = build_vgg16_feature_extractor(up_to_block=2, input_ch=3)
+        model2.set_weights(weights)
+        self.assertTrue(np.allclose(out, model2.Forward(x, training=False)))
+
+        with self.assertRaises(ValueError):
+            build_vgg16_feature_extractor(up_to_block=6)
+
+    def test_vgg_loss_with_vgg16_extractor(self):
+        from Enilnets.generative.pretrained import build_vgg16_feature_extractor
+        from Enilnets.generative.generative_loss import vgg_loss
+        np.random.seed(0)
+        model = build_vgg16_feature_extractor(up_to_block=1, input_ch=3)
+        x = np.random.randn(2, 3, 16, 16)
+        y = np.random.randn(2, 3, 16, 16)
+        loss = vgg_loss(x, y, vgg_features=model.Forward)
+        self.assertIsInstance(loss, float)
+        self.assertGreaterEqual(loss, 0.0)
+
+
+class TestV31Phase4Conv1D(unittest.TestCase):
+    """v3.1.0 Phase 4: add_conv1d for (batch, channels, length) data."""
+
+    def _fd_check_param(self, model, X, Y, layer_idx, param_name, eps=1e-5, n_check=6):
+        model.Forward(X, training=True)
+        model.Backward(Y, loss_function="mse")
+        analytic = model.compute_gradients()[layer_idx][param_name]
+        flat = model.layers[layer_idx][param_name].reshape(-1)
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
+        max_err = 0.0
+        for idx in idxs:
+            orig = flat[idx]
+            flat[idx] = orig + eps
+            loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig - eps
+            loss_m = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+            flat[idx] = orig
+            num_grad = (loss_p - loss_m) / (2 * eps)
+            max_err = max(max_err, abs(num_grad - analytic.reshape(-1)[idx]))
+        return max_err
+
+    def test_forward_shapes_valid_and_same(self):
+        m_valid = NeuralNet()
+        m_valid.add_conv1d(in_ch=1, out_ch=4, k=3, input_size=10)  # default padding="valid"
+        self.assertEqual(m_valid._last_spatial_1d, (4, 8))
+        m_same = NeuralNet()
+        m_same.add_conv1d(in_ch=1, out_ch=4, k=3, input_size=10, padding="same")
+        self.assertEqual(m_same._last_spatial_1d, (4, 10))
+
+    def test_fd_gradients_weights_and_bias(self):
+        np.random.seed(0)
+        for padding in ("valid", "same"):
+            model = NeuralNet(optimizer="sgd")
+            model.add_conv1d(in_ch=2, out_ch=3, k=3, activation="tanh", input_size=12, padding=padding)
+            model.add_flatten()
+            model.add_dense(None, 4, activation="linear")
+            X = np.random.randn(2, 2, 12)
+            Y = np.random.randn(2, 4)
+            self.assertLess(self._fd_check_param(model, X, Y, 0, "weights"), 1e-6)
+            self.assertLess(self._fd_check_param(model, X, Y, 0, "bias"), 1e-6)
+
+    def test_fd_gradients_input(self):
+        np.random.seed(0)
+        for padding in ("valid", "same"):
+            model = NeuralNet(optimizer="sgd")
+            model.add_conv1d(in_ch=2, out_ch=2, k=1, activation="linear", input_size=12)
+            model.layers[0]["weights"] = np.eye(2).reshape(2, 2, 1)
+            model.layers[0]["bias"] = np.zeros(2)
+            model.add_conv1d(out_ch=3, k=3, activation="tanh", padding=padding)
+            model.add_flatten()
+            model.add_dense(None, 4, activation="linear")
+            X = np.random.randn(2, 2, 12)
+            Y = np.random.randn(2, 4)
+
+            model.Forward(X, training=True)
+            model.Backward(Y, loss_function="mse")
+            dx = model.deltas[0].copy()
+            eps = 1e-5
+            flat = X.reshape(-1)
+            rng = np.random.RandomState(1)
+            idxs = rng.choice(flat.size, size=6, replace=False)
+            max_err = 0.0
+            for idx in idxs:
+                orig = flat[idx]
+                flat[idx] = orig + eps
+                lp = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+                flat[idx] = orig - eps
+                lm = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
+                flat[idx] = orig
+                num = (lp - lm) / (2 * eps)
+                max_err = max(max_err, abs(num - dx.reshape(-1)[idx]))
+            self.assertLess(max_err, 1e-6)
+
+    def test_same_padding_requires_stride_1_and_odd_k(self):
+        with self.assertRaises(ValueError):
+            NeuralNet().add_conv1d(in_ch=1, out_ch=2, k=3, stride=2, padding="same", input_size=10)
+        with self.assertRaises(ValueError):
+            NeuralNet().add_conv1d(in_ch=1, out_ch=2, k=4, padding="same", input_size=10)
+
+    def test_unknown_padding_raises(self):
+        with self.assertRaises(ValueError):
+            NeuralNet().add_conv1d(in_ch=1, out_ch=2, k=3, padding="full", input_size=10)
+
+    def test_flatten_uses_1d_spatial_not_2d(self):
+        model = NeuralNet()
+        model.add_conv1d(in_ch=1, out_ch=4, k=3, input_size=10, padding="same")
+        model.add_flatten()
+        self.assertEqual(model._last_width, 40)  # 4 * 10, not misread as 2D
+        self.assertIsNone(model._last_spatial_1d)
+        self.assertIsNone(model._last_spatial)
+
+    def test_save_load_roundtrip(self):
+        import tempfile, os
+        np.random.seed(0)
+        model = NeuralNet(optimizer="adam")
+        model.add_conv1d(in_ch=1, out_ch=4, k=3, input_size=10, padding="same", activation="relu")
+        model.add_conv1d(out_ch=8, k=3, padding="same", activation="relu")
+        model.add_flatten()
+        model.add_dense(None, 3, activation="softmax")
+        X = np.random.randn(2, 1, 10)
+        out = model.Forward(X, training=False)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.pkl")
+            model.Save(path)
+            m2 = NeuralNet()
+            m2.Load(path)
+            self.assertTrue(np.allclose(out, m2.Forward(X, training=False)))
+
+    def test_trains_e2e(self):
+        np.random.seed(0)
+        model = NeuralNet(optimizer="adam", learning_rate=0.02)
+        model.add_conv1d(in_ch=1, out_ch=8, k=3, input_size=16, padding="same", activation="relu")
+        model.add_flatten()
+        model.add_dense(None, 2, activation="softmax")
+        X = np.random.randn(20, 1, 16)
+        Y = np.eye(2)[(X.sum(axis=(1, 2)) > 0).astype(int)]
+        losses = [model.TrainBatch(X, Y, loss_function="cross_entropy")[0] for _ in range(20)]
+        self.assertLess(losses[-1], losses[0])
 
 
 # ========================================================================

@@ -1,5 +1,5 @@
 import numpy as np
-from .weight_init import init_weights, init_conv_weights, init_embedding_weights
+from .weight_init import init_weights, init_conv_weights, init_conv1d_weights, init_embedding_weights
 
 def _require_width(self, what):
     if self._last_width is None:
@@ -20,6 +20,7 @@ def add_dense(self, n_in=None, n_out=128, activation="relu", init_method="xavier
                         "use_bias": use_bias, "activation_params": activation_params or {}})
     self._last_width = n_out
     self._last_spatial = None
+    self._last_spatial_1d = None
 
 def add_sparse(self, n_in=None, n_out=128, connectivity=0.5, activation="relu",
                init_method="xavier_uniform", activation_params=None):
@@ -31,12 +32,19 @@ def add_sparse(self, n_in=None, n_out=128, connectivity=0.5, activation="relu",
                         "activation": activation, "activation_params": activation_params or {}})
     self._last_width = n_out
     self._last_spatial = None
+    self._last_spatial_1d = None
 
 def add_conv2d(self, in_ch=None, out_ch=32, k=3, activation="relu", init_method="he_normal",
-               stride=1, activation_params=None, input_size=None):
+               stride=1, activation_params=None, input_size=None, padding="valid"):
     """input_size: optional (H, W) -- only needed on the very first conv2d call
     if you want add_flatten() to later auto-infer its output width. Later
-    conv2d/pool/upsample calls propagate spatial size automatically."""
+    conv2d/pool/upsample calls propagate spatial size automatically.
+
+    padding: "valid" (default, no padding -- output shrinks with kernel
+        size, exact pre-existing behavior) or "same" (output spatial size
+        equals input spatial size). "same" only supports stride=1 and an
+        odd kernel size k (raises ValueError otherwise -- avoids asymmetric
+        padding edge cases)."""
     if in_ch is None:
         if self._last_spatial is not None:
             in_ch = self._last_spatial[0]
@@ -45,25 +53,88 @@ def add_conv2d(self, in_ch=None, out_ch=32, k=3, activation="relu", init_method=
                 "Cannot auto-infer in_ch for add_conv2d: no previous conv/pool layer. "
                 "Pass in_ch explicitly for the first conv2d layer in the model."
             )
+    if padding == "valid":
+        pad = 0
+    elif padding == "same":
+        if stride != 1 or k % 2 == 0:
+            raise ValueError(
+                f'padding="same" only supports stride=1 and an odd kernel size '
+                f"(got stride={stride}, k={k})."
+            )
+        pad = (k - 1) // 2
+    else:
+        raise ValueError(f"Unknown padding: {padding!r}. Expected 'valid' or 'same'.")
     w, b = init_conv_weights(in_ch, out_ch, k, method=init_method)
     self.layers.append({"type": "conv2d", "weights": w, "bias": b, "in_ch": in_ch, "out_ch": out_ch,
-                        "k": k, "activation": activation, "stride": stride,
+                        "k": k, "activation": activation, "stride": stride, "padding": padding, "pad": pad,
                         "activation_params": activation_params or {}})
     self._last_width = out_ch
+    self._last_spatial_1d = None
     if self._last_spatial is not None:
         H, W = self._last_spatial[1], self._last_spatial[2]
-        self._last_spatial = (out_ch, (H - k) // stride + 1, (W - k) // stride + 1)
+        self._last_spatial = (out_ch, (H + 2 * pad - k) // stride + 1, (W + 2 * pad - k) // stride + 1)
     elif input_size is not None:
         H, W = input_size
-        self._last_spatial = (out_ch, (H - k) // stride + 1, (W - k) // stride + 1)
+        self._last_spatial = (out_ch, (H + 2 * pad - k) // stride + 1, (W + 2 * pad - k) // stride + 1)
     else:
         self._last_spatial = None
 
+def add_conv1d(self, in_ch=None, out_ch=32, k=3, activation="relu", init_method="he_normal",
+               stride=1, activation_params=None, input_size=None, padding="valid"):
+    """1D convolution for `(batch, channels, length)` data (audio, raw
+    sequences, time series), mirroring `add_conv2d` throughout.
+
+    input_size: optional int length L -- only needed on the very first
+        conv1d call, to let a later add_flatten() auto-infer its output
+        width. Later conv1d calls propagate length automatically via a
+        separate `_last_spatial_1d` tracker (kept distinct from
+        `add_conv2d`'s `_last_spatial` so a 1D `(C, L)` tuple is never
+        misread as a 2D `(C, H, W)` one, or vice versa).
+
+    padding: "valid" (default) or "same" (stride=1 + odd kernel size k
+        only, same restriction and rationale as add_conv2d)."""
+    if in_ch is None:
+        if self._last_spatial_1d is not None:
+            in_ch = self._last_spatial_1d[0]
+        else:
+            raise ValueError(
+                "Cannot auto-infer in_ch for add_conv1d: no previous conv1d layer. "
+                "Pass in_ch explicitly for the first conv1d layer in the model."
+            )
+    if padding == "valid":
+        pad = 0
+    elif padding == "same":
+        if stride != 1 or k % 2 == 0:
+            raise ValueError(
+                f'padding="same" only supports stride=1 and an odd kernel size '
+                f"(got stride={stride}, k={k})."
+            )
+        pad = (k - 1) // 2
+    else:
+        raise ValueError(f"Unknown padding: {padding!r}. Expected 'valid' or 'same'.")
+    w, b = init_conv1d_weights(in_ch, out_ch, k, method=init_method)
+    self.layers.append({"type": "conv1d", "weights": w, "bias": b, "in_ch": in_ch, "out_ch": out_ch,
+                        "k": k, "activation": activation, "stride": stride, "padding": padding, "pad": pad,
+                        "activation_params": activation_params or {}})
+    self._last_width = out_ch
+    self._last_spatial = None
+    if self._last_spatial_1d is not None:
+        L = self._last_spatial_1d[1]
+        self._last_spatial_1d = (out_ch, (L + 2 * pad - k) // stride + 1)
+    elif input_size is not None:
+        self._last_spatial_1d = (out_ch, (input_size + 2 * pad - k) // stride + 1)
+    else:
+        self._last_spatial_1d = None
+
 def add_flatten(self):
-    if self._last_spatial is not None:
+    if self._last_spatial_1d is not None:
+        C, L = self._last_spatial_1d
+        self._last_width = C * L
+    elif self._last_spatial is not None:
         C, H, W = self._last_spatial
         self._last_width = C * H * W
     self._last_spatial = None
+    self._last_spatial_1d = None
     self.layers.append({"type": "flatten"})
 
 def add_maxpool2d(self, pool_size=2):
@@ -126,9 +197,10 @@ def add_embedding(self, vocab_size, embed_dim, init_method="normal"):
     self.layers.append({"type": "embedding", "weights": w, "vocab_size": vocab_size, "embed_dim": embed_dim})
     self._last_width = embed_dim
     self._last_spatial = None
+    self._last_spatial_1d = None
 
 def add_multihead_attention(self, embed_dim=None, num_heads=4, dropout=0.0, init_method="xavier_uniform",
-                             causal=False):
+                             causal=False, positional_scheme="absolute"):
     """Add a multi-head self-attention layer.
 
     Input/output shape: (batch, seq_len, embed_dim).
@@ -138,11 +210,21 @@ def add_multihead_attention(self, embed_dim=None, num_heads=4, dropout=0.0, init
 
     causal: if True, position i can only attend to positions <= i (for
         autoregressive / language-model style decoders).
+    positional_scheme: "absolute" (default -- no positional info is added
+        here; pair with add_positional_encoding() as usual), "rope"
+        (rotary position embedding -- rotates Q/K per head before the score
+        dot product; requires an even head_dim), or "alibi" (a static
+        per-head linear-distance bias added to the scores, no extra
+        parameters or positional_encoding layer needed).
     """
     if embed_dim is None:
         embed_dim = _require_width(self, "add_multihead_attention")
     assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
     head_dim = embed_dim // num_heads
+    if positional_scheme not in ("absolute", "rope", "alibi"):
+        raise ValueError(f"Unknown positional_scheme: {positional_scheme!r}. Expected 'absolute', 'rope', or 'alibi'.")
+    if positional_scheme == "rope" and head_dim % 2 != 0:
+        raise ValueError(f"positional_scheme='rope' requires an even head_dim, got {head_dim}")
     Wq, bq = init_weights(embed_dim, embed_dim, method=init_method)
     Wk, bk = init_weights(embed_dim, embed_dim, method=init_method)
     Wv, bv = init_weights(embed_dim, embed_dim, method=init_method)
@@ -154,6 +236,7 @@ def add_multihead_attention(self, embed_dim=None, num_heads=4, dropout=0.0, init
         "head_dim": head_dim,
         "dropout": dropout,
         "causal": causal,
+        "positional_scheme": positional_scheme,
         "Wq": Wq, "bq": bq,
         "Wk": Wk, "bk": bk,
         "Wv": Wv, "bv": bv,
@@ -161,6 +244,51 @@ def add_multihead_attention(self, embed_dim=None, num_heads=4, dropout=0.0, init
     })
     self._last_width = embed_dim
     self._last_spatial = None
+    self._last_spatial_1d = None
+
+def add_cross_attention(self, kv_source_index, embed_dim=None, num_heads=4, dropout=0.0,
+                         init_method="xavier_uniform"):
+    """Add a cross-attention layer (encoder-decoder style): queries come
+    from the normal sequential `x`; keys/values come from an earlier
+    layer's output.
+
+    kv_source_index: directly names "the layer whose output is the KV
+        source" -- self.outputs[kv_source_index + 1] is the target
+        directly, NO -1 adjustment (same direct-indexing convention as
+        "goto"/"concat_at", NOT residual's save_index convention, which
+        points AT a marker layer and needs -1).
+
+    Input/output shape: (batch, seq_len_q, embed_dim) for the sequential
+    `x`; the KV source must be (batch, seq_len_kv, embed_dim) with the
+    SAME embed_dim (e.g. an encoder stack's final layer). Stores its own
+    Wq/bq/Wk/bk/Wv/bv/Wo/bo projection weights directly on the layer, same
+    as add_multihead_attention. No causal masking (cross-attention
+    conventionally attends freely over the full KV source) and no
+    positional_scheme (RoPE/ALiBi are self-attention concepts here).
+    """
+    if embed_dim is None:
+        embed_dim = _require_width(self, "add_cross_attention")
+    assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+    head_dim = embed_dim // num_heads
+    Wq, bq = init_weights(embed_dim, embed_dim, method=init_method)
+    Wk, bk = init_weights(embed_dim, embed_dim, method=init_method)
+    Wv, bv = init_weights(embed_dim, embed_dim, method=init_method)
+    Wo, bo = init_weights(embed_dim, embed_dim, method=init_method)
+    self.layers.append({
+        "type": "cross_attention",
+        "embed_dim": embed_dim,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "dropout": dropout,
+        "kv_source_index": kv_source_index,
+        "Wq": Wq, "bq": bq,
+        "Wk": Wk, "bk": bk,
+        "Wv": Wv, "bv": bv,
+        "Wo": Wo, "bo": bo,
+    })
+    self._last_width = embed_dim
+    self._last_spatial = None
+    self._last_spatial_1d = None
 
 def add_mlp_block(self, hidden_dims, in_dim=None, out_dim=None, activation="relu",
                    out_activation="linear", init_method="xavier_uniform"):
@@ -180,14 +308,16 @@ def add_mlp_block(self, hidden_dims, in_dim=None, out_dim=None, activation="relu
         self.add_dense(n_in, out_dim, activation=out_activation, init_method=init_method)
 
 def add_conv_block(self, out_ch, k=3, activation="relu", init_method="he_normal",
-                    in_ch=None, stride=1, batchnorm=False, pool=None, input_size=None):
+                    in_ch=None, stride=1, batchnorm=False, pool=None, input_size=None,
+                    padding="valid"):
     """Convenience: one conv2d (with its activation), optionally followed by
     batchnorm and/or pooling: conv2d(activation) -> [batchnorm] -> [pool].
 
     pool: None, "max", or "avg" (pool_size=2).
     """
     self.add_conv2d(in_ch, out_ch, k, activation=activation,
-                    init_method=init_method, stride=stride, input_size=input_size)
+                    init_method=init_method, stride=stride, input_size=input_size,
+                    padding=padding)
     if batchnorm:
         self.add_batchnorm(out_ch)
     if pool == "max":
@@ -208,6 +338,7 @@ def add_rnn(self, n_in=None, hidden_dim=128, return_sequences=True, init_method=
                         "return_sequences": return_sequences})
     self._last_width = hidden_dim
     self._last_spatial = None
+    self._last_spatial_1d = None
 
 def add_lstm(self, n_in=None, hidden_dim=128, return_sequences=True, init_method="xavier_uniform"):
     """Add an LSTM layer. Gate weights are stacked as a single (4*hidden, ·)
@@ -225,6 +356,7 @@ def add_lstm(self, n_in=None, hidden_dim=128, return_sequences=True, init_method
                         "return_sequences": return_sequences})
     self._last_width = hidden_dim
     self._last_spatial = None
+    self._last_spatial_1d = None
 
 def add_gru(self, n_in=None, hidden_dim=128, return_sequences=True, init_method="xavier_uniform"):
     """Add a GRU layer. Gate weights are stacked as a single (3*hidden, ·)
@@ -242,6 +374,66 @@ def add_gru(self, n_in=None, hidden_dim=128, return_sequences=True, init_method=
                         "return_sequences": return_sequences})
     self._last_width = hidden_dim
     self._last_spatial = None
+    self._last_spatial_1d = None
+
+def _add_bidirectional(self, add_fn, n_in, hidden_dim, return_sequences, init_method):
+    """Shared composition for add_bidirectional_rnn/_lstm/_gru: run
+    `add_fn` (one of self.add_rnn/add_lstm/add_gru) once forward and once
+    on the time-reversed input (via the "goto"/"reverse_sequence"
+    primitives), then concatenate both directions' outputs along the
+    feature axis via "concat_at".
+
+    n_in must be resolved to a concrete int (not left None) before the
+    SECOND add_fn call: after the forward direction runs, self._last_width
+    is hidden_dim (the forward RNN's own output width), not the original
+    input width -- the "goto" jump back to source_index doesn't update
+    _last_width bookkeeping (only add_* layer-builder calls do), so
+    auto-inference would silently use the wrong width for the backward
+    direction if n_in weren't already a concrete number by then.
+    """
+    if n_in is None:
+        n_in = _require_width(self, add_fn.__name__)
+    source_index = len(self.layers) - 1
+    add_fn(n_in, hidden_dim, return_sequences=return_sequences, init_method=init_method)  # forward direction
+    fwd_index = len(self.layers) - 1
+    self.layers.append({"type": "goto", "stored_index": source_index})
+    self.layers.append({"type": "reverse_sequence"})
+    add_fn(n_in, hidden_dim, return_sequences=return_sequences, init_method=init_method)  # backward direction (reversed input)
+    if return_sequences:
+        # Un-reverse before concatenating so timestep t aligns correctly --
+        # the backward direction's raw output is in reversed-time order.
+        # When return_sequences=False, each direction's output is already
+        # a single collapsed (batch, hidden) summary (no time axis left to
+        # un-reverse): the forward direction's summary is of the sequence
+        # read left-to-right, the backward direction's is of the sequence
+        # read right-to-left, and concatenating them directly is exactly
+        # the standard bidirectional-summary construction.
+        self.layers.append({"type": "reverse_sequence"})
+    bwd_index = len(self.layers) - 1
+    self.layers.append({"type": "concat_at", "idx_a": fwd_index, "idx_b": bwd_index})
+    self._last_width = hidden_dim * 2
+    self._last_spatial = None
+    self._last_spatial_1d = None
+
+def add_bidirectional_rnn(self, n_in=None, hidden_dim=128, return_sequences=True, init_method="xavier_uniform"):
+    """Bidirectional vanilla RNN: runs add_rnn once forward and once over
+    the time-reversed input, concatenating both directions' hidden states
+    along the feature axis -- output width is hidden_dim * 2.
+    return_sequences=True: (batch, seq_len, hidden_dim*2).
+    return_sequences=False: (batch, hidden_dim*2) (forward's final state
+    concatenated with backward's final state -- see _add_bidirectional's
+    docstring for why no un-reversing is needed in that case)."""
+    _add_bidirectional(self, self.add_rnn, n_in, hidden_dim, return_sequences, init_method)
+
+def add_bidirectional_lstm(self, n_in=None, hidden_dim=128, return_sequences=True, init_method="xavier_uniform"):
+    """Bidirectional LSTM -- see add_bidirectional_rnn for the composition
+    and shape convention (output width hidden_dim * 2)."""
+    _add_bidirectional(self, self.add_lstm, n_in, hidden_dim, return_sequences, init_method)
+
+def add_bidirectional_gru(self, n_in=None, hidden_dim=128, return_sequences=True, init_method="xavier_uniform"):
+    """Bidirectional GRU -- see add_bidirectional_rnn for the composition
+    and shape convention (output width hidden_dim * 2)."""
+    _add_bidirectional(self, self.add_gru, n_in, hidden_dim, return_sequences, init_method)
 
 def add_residual_start(self):
     """Mark the start of a residual/skip-connection block. Pair with a later

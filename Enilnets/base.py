@@ -10,9 +10,15 @@ class NeuralNet:
                  adam_epsilon=constants.ADAM_EPSILON,
                  rmsprop_decay=constants.RMSPROP_DECAY, rmsprop_epsilon=constants.RMSPROP_EPSILON,
                  adagrad_epsilon=constants.ADAGRAD_EPSILON):
+        optimizer_type = optimizer.lower()
+        if optimizer_type not in ("sgd", "rmsprop", "adagrad", "adam", "adamw"):
+            raise ValueError(
+                f"Unknown optimizer: {optimizer!r}. Expected one of "
+                f"'sgd', 'rmsprop', 'adagrad', 'adam', 'adamw'."
+            )
         self.layers = []
         self.learning_rate = learning_rate
-        self.optimizer_type = optimizer.lower()
+        self.optimizer_type = optimizer_type
         self.l2_lambda = l2_lambda
         self.momentum = momentum
         self.grad_clip_norm = grad_clip_norm
@@ -38,6 +44,7 @@ class NeuralNet:
         self._accum_steps = 0
         self._last_width = None
         self._last_spatial = None
+        self._last_spatial_1d = None
         self._residual_stack = []
 
     def train(self):
@@ -124,6 +131,7 @@ class NeuralNet:
         net.training = self.training
         net._last_width = self._last_width
         net._last_spatial = self._last_spatial
+        net._last_spatial_1d = self._last_spatial_1d
         net._residual_stack = list(self._residual_stack)
         return net
 
@@ -187,7 +195,7 @@ class NeuralNet:
         print("=" * 70)
 
 # Import and bind all submodule methods after class definition
-from .layers import add_dense, add_sparse, add_conv2d, add_flatten, add_maxpool2d, add_avgpool2d, add_batchnorm, add_dropout, add_layernorm, add_global_avgpool2d, add_upsample2d, add_embedding, add_multihead_attention, add_mlp_block, add_conv_block, add_residual_start, add_residual_end, add_rnn, add_lstm, add_gru
+from .layers import add_dense, add_sparse, add_conv2d, add_conv1d, add_flatten, add_maxpool2d, add_avgpool2d, add_batchnorm, add_dropout, add_layernorm, add_global_avgpool2d, add_upsample2d, add_embedding, add_multihead_attention, add_cross_attention, add_mlp_block, add_conv_block, add_residual_start, add_residual_end, add_rnn, add_lstm, add_gru, add_bidirectional_rnn, add_bidirectional_lstm, add_bidirectional_gru
 from .transformer_layers import add_transformer_block, add_positional_encoding, add_vision_transformer_patch_embed
 from .forward import Forward
 from .backward import Backward
@@ -201,6 +209,7 @@ from .visualization import plot_network
 NeuralNet.add_dense = add_dense
 NeuralNet.add_sparse = add_sparse
 NeuralNet.add_conv2d = add_conv2d
+NeuralNet.add_conv1d = add_conv1d
 NeuralNet.add_flatten = add_flatten
 NeuralNet.add_maxpool2d = add_maxpool2d
 NeuralNet.add_avgpool2d = add_avgpool2d
@@ -211,6 +220,7 @@ NeuralNet.add_global_avgpool2d = add_global_avgpool2d
 NeuralNet.add_upsample2d = add_upsample2d
 NeuralNet.add_embedding = add_embedding
 NeuralNet.add_multihead_attention = add_multihead_attention
+NeuralNet.add_cross_attention = add_cross_attention
 NeuralNet.add_mlp_block = add_mlp_block
 NeuralNet.add_conv_block = add_conv_block
 NeuralNet.add_residual_start = add_residual_start
@@ -218,6 +228,9 @@ NeuralNet.add_residual_end = add_residual_end
 NeuralNet.add_rnn = add_rnn
 NeuralNet.add_lstm = add_lstm
 NeuralNet.add_gru = add_gru
+NeuralNet.add_bidirectional_rnn = add_bidirectional_rnn
+NeuralNet.add_bidirectional_lstm = add_bidirectional_lstm
+NeuralNet.add_bidirectional_gru = add_bidirectional_gru
 NeuralNet.add_transformer_block = add_transformer_block
 NeuralNet.add_positional_encoding = add_positional_encoding
 NeuralNet.add_vision_transformer_patch_embed = add_vision_transformer_patch_embed

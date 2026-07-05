@@ -1,6 +1,6 @@
 import numpy as np
 from .activations import derivative
-from .forward import im2col
+from .forward import im2col, im2col1d, _rope_cos_sin, _rope_rotate
 from . import constants
 
 def maxpool2d_backward(delta, x, p):
@@ -164,8 +164,20 @@ def multihead_attention_backward(dout, layer, cache):
     dscores = attn * (dattn - np.sum(dattn * attn, axis=-1, keepdims=True))
     dscores = dscores / np.sqrt(Dh)
 
+    # Note: Qh/Kh here are whatever was actually fed into the score matmul in
+    # Forward() -- i.e. already RoPE-rotated if positional_scheme="rope" --
+    # so dQh/dKh below are gradients w.r.t. the ROTATED tensors.
     dQh = np.matmul(dscores, Kh)
     dKh = np.matmul(dscores.transpose(0, 1, 3, 2), Qh)
+
+    if layer.get("positional_scheme") == "rope":
+        # Un-rotate before using these for d_Wq/d_Wk/dx: Q/K (pre-rotation)
+        # are what the Wq/Wk projections actually produced. Rotation is
+        # orthogonal (a per-pair 2D rotation), so its inverse is the same
+        # rotation with the angle negated (cos(-t)=cos(t), sin(-t)=-sin(t)).
+        rope_cos, rope_sin = _rope_cos_sin(S, Dh, constants.SINUSOIDAL_BASE)
+        dQh = _rope_rotate(dQh, rope_cos, -rope_sin)
+        dKh = _rope_rotate(dKh, rope_cos, -rope_sin)
 
     dQ = dQh.transpose(0, 2, 1, 3).reshape(B, S, E)
     dK = dKh.transpose(0, 2, 1, 3).reshape(B, S, E)
@@ -186,6 +198,67 @@ def multihead_attention_backward(dout, layer, cache):
 
     dx = np.dot(dQ, layer["Wq"]) + np.dot(dK, layer["Wk"]) + np.dot(dV, layer["Wv"])
     return dx
+
+def cross_attention_backward(dout, layer, cache):
+    """Backprop through cross-attention (Q from the sequential input, K/V
+    from an earlier layer's output). Adapted from
+    multihead_attention_backward -- the math is identical except Q's and
+    K/V's sources differ, which matters in exactly two places: `dQ` flows
+    normally into the caller's `dx` (returned as the first element, same
+    as self-attention), while `dK`/`dV`'s COMBINED contribution has ZERO
+    path back through `x_in` at all -- it must be deferred entirely to the
+    KV-source layer (`d_kv`, returned as the second element; the caller
+    routes it via `_defer_grad(layer["kv_source_index"], d_kv)`, no -1
+    offset). `Wq`'s param gradient uses `x_in`; `Wk`/`Wv`'s use `kv_source`
+    -- the other correctness-critical divergence from self-attention.
+
+    dout: gradient w.r.t. this layer's output, shape (B, Sq, E)
+    cache: (Q, K, V, Qh, Kh, Vh, attn, context, x_in, kv_source)
+    Returns (dx, d_kv).
+    """
+    Q, K, V, Qh, Kh, Vh, attn, context, x_in, kv_source = cache
+    B, Sq, E = dout.shape
+    Skv = kv_source.shape[1]
+    Dh = layer["head_dim"]
+
+    dout_flat = dout.reshape(-1, E)
+    context_flat = context.reshape(-1, E)
+    d_Wo = np.dot(dout_flat.T, context_flat)
+    d_bo = np.sum(dout_flat, axis=0)
+    dcontext = np.dot(dout, layer["Wo"])
+
+    dcontext_h = dcontext.reshape(B, Sq, -1, Dh).transpose(0, 2, 1, 3)
+    dVh = np.matmul(attn.transpose(0, 1, 3, 2), dcontext_h)
+    dattn = np.matmul(dcontext_h, Vh.transpose(0, 1, 3, 2))
+
+    # softmax Jacobian-vector product (over the Skv axis, the last axis of attn)
+    dscores = attn * (dattn - np.sum(dattn * attn, axis=-1, keepdims=True))
+    dscores = dscores / np.sqrt(Dh)
+
+    dQh = np.matmul(dscores, Kh)
+    dKh = np.matmul(dscores.transpose(0, 1, 3, 2), Qh)
+
+    dQ = dQh.transpose(0, 2, 1, 3).reshape(B, Sq, E)
+    dK = dKh.transpose(0, 2, 1, 3).reshape(B, Skv, E)
+    dV = dVh.transpose(0, 2, 1, 3).reshape(B, Skv, E)
+
+    x_in_flat = x_in.reshape(-1, E)
+    kv_source_flat = kv_source.reshape(-1, E)
+    d_Wq = np.dot(dQ.reshape(-1, E).T, x_in_flat)
+    d_bq = np.sum(dQ.reshape(-1, E), axis=0)
+    d_Wk = np.dot(dK.reshape(-1, E).T, kv_source_flat)
+    d_bk = np.sum(dK.reshape(-1, E), axis=0)
+    d_Wv = np.dot(dV.reshape(-1, E).T, kv_source_flat)
+    d_bv = np.sum(dV.reshape(-1, E), axis=0)
+
+    layer["d_Wq"], layer["d_bq"] = d_Wq, d_bq
+    layer["d_Wk"], layer["d_bk"] = d_Wk, d_bk
+    layer["d_Wv"], layer["d_bv"] = d_Wv, d_bv
+    layer["d_Wo"], layer["d_bo"] = d_Wo, d_bo
+
+    dx = np.dot(dQ, layer["Wq"])
+    d_kv = np.dot(dK, layer["Wk"]) + np.dot(dV, layer["Wv"])
+    return dx, d_kv
 
 def rnn_backward(dout, layer, cache):
     """BPTT for a vanilla tanh RNN. dout is the gradient w.r.t. this layer's
@@ -317,7 +390,7 @@ def gru_backward(dout, layer, cache):
     layer["d_Wx"], layer["d_Wh"], layer["d_bx"], layer["d_bh"] = dWx, dWh, dbx, dbh
     return dx
 
-def conv2d_backward_input(delta, weights, input_shape, stride=1):
+def conv2d_backward_input(delta, weights, input_shape, stride=1, pad=0):
     B, F, out_h, out_w = delta.shape
     F, C, K, _ = weights.shape
     H, W = input_shape[2], input_shape[3]
@@ -339,7 +412,31 @@ def conv2d_backward_input(delta, weights, input_shape, stride=1):
     out_h2 = padded_delta.shape[2] - K + 1
     out_w2 = padded_delta.shape[3] - K + 1
     grad = grad.reshape(B, out_h2, out_w2, C).transpose(0, 3, 1, 2)
-    return grad[:, :, :H, :W]
+    # The transposed-conv above computes the gradient w.r.t. the *padded*
+    # input (spatial size H+2*pad); slice out the pad-sized border to get
+    # the gradient w.r.t. the original unpadded input. pad=0 (default,
+    # "valid" padding) makes this a no-op slice, byte-identical to before.
+    return grad[:, :, pad:pad + H, pad:pad + W]
+
+def conv1d_backward_input(delta, weights, input_shape, stride=1, pad=0):
+    B, F, out_l = delta.shape
+    F, C, K = weights.shape
+    L = input_shape[2]
+
+    if stride > 1:
+        dilated_l = (out_l - 1) * stride + 1
+        dilated = np.zeros((B, F, dilated_l), dtype=delta.dtype)
+        dilated[:, :, ::stride] = delta
+    else:
+        dilated = delta
+
+    padded_delta = np.pad(dilated, [(0, 0), (0, 0), (K - 1, K - 1)], mode="constant")
+    col = im2col1d(padded_delta, K)
+    weights_flat = weights[:, :, ::-1].transpose(1, 0, 2).reshape(C, -1)
+    grad = np.dot(col, weights_flat.T)
+    out_l2 = padded_delta.shape[2] - K + 1
+    grad = grad.reshape(B, out_l2, C).transpose(0, 2, 1)
+    return grad[:, :, pad:pad + L]
 
 def _loss_divisor(o, batch_size, loss_function, loss_kwargs):
     """Matches loss.py's ComputeLoss reduction convention: losses whose forward
@@ -355,7 +452,7 @@ def _loss_divisor(o, batch_size, loss_function, loss_kwargs):
     if reduction == "sum":
         return 1.0
     feature_reduced = loss_function in (
-        "cross_entropy", "categorical_cross_entropy",
+        "cross_entropy", "categorical_cross_entropy", "sparse_cross_entropy",
         "cosine_similarity", "triplet", "ntxent",
     )
     return float(batch_size) if feature_reduced else float(o.size)
@@ -372,6 +469,11 @@ def _loss_output_delta(o, t, z, activation, loss_function, batch_size, loss_kwar
 
     if activation == "softmax" and loss_function in (None, "cross_entropy", "categorical_cross_entropy"):
         return (o - t) / divisor
+    if activation == "softmax" and loss_function == "sparse_cross_entropy":
+        idx = t.astype(np.int64)
+        onehot = np.zeros_like(o)
+        np.put_along_axis(onehot, idx[..., None], 1.0, axis=-1)
+        return (o - onehot) / divisor
     if activation == "sigmoid" and loss_function == "binary_cross_entropy":
         return (o - t) / divisor
     if loss_function == "bce_logits":
@@ -405,6 +507,12 @@ def _loss_output_delta(o, t, z, activation, loss_function, batch_size, loss_kwar
     elif loss_function in ("cross_entropy", "categorical_cross_entropy"):
         oc = np.clip(o, eps, 1.0)
         dL_do = -t / oc
+    elif loss_function == "sparse_cross_entropy":
+        oc = np.clip(o, eps, 1.0)
+        idx = t.astype(np.int64)
+        picked = np.take_along_axis(oc, idx[..., None], axis=-1)
+        dL_do = np.zeros_like(o)
+        np.put_along_axis(dL_do, idx[..., None], -1.0 / picked, axis=-1)
     elif loss_function == "focal":
         alpha = loss_kwargs.get("alpha", 0.25)
         gamma = loss_kwargs.get("gamma", 2.0)
@@ -469,9 +577,15 @@ def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_k
         if targets is None:
             raise ValueError("targets must be provided if output_delta is not given")
         targets = np.asarray(targets, dtype=np.float64)
-        if targets.ndim == 1:
-            targets = targets.reshape(1, -1)
-        batch_size = targets.shape[0]
+        if loss_function == "sparse_cross_entropy":
+            # targets are integer class indices shaped like out.shape[:-1]
+            # (e.g. (B,) or (B,S)) -- not a one-hot array, so the generic
+            # "1D -> (1, features)" reshape below doesn't apply here.
+            batch_size = int(np.prod(targets.shape))
+        else:
+            if targets.ndim == 1:
+                targets = targets.reshape(1, -1)
+            batch_size = int(np.prod(targets.shape[:-1]))
         self.deltas = [None] * len(self.layers)
         out = self.outputs[-1]
         last = self.layers[-1]
@@ -482,26 +596,86 @@ def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_k
         self.deltas[-1] = delta
 
     # Gradient normally flows strictly sequentially (deltas[l] built only from
-    # deltas[l+1]), but a residual_add layer sends its incoming gradient to
-    # TWO places: back through the block it wraps (handled by the normal loop
-    # below) AND directly to the layer *before* the matching residual_save --
-    # i.e. the shared tensor x0 that both the block and the skip path started
-    # from (self.outputs[save_index] == output of layer save_index-1).
-    # deferred_grad holds that second contribution until the loop reaches it.
+    # deltas[l+1]), but some layer types send their incoming gradient to
+    # ADDITIONAL places beyond the normal chain: residual_add sends a copy
+    # directly to the layer *before* the matching residual_save (the shared
+    # tensor x0 that both the block and the skip path started from); goto/
+    # concat_at (multi-source layers -- used by bidirectional RNN and
+    # cross-attention) send their ENTIRE incoming gradient elsewhere
+    # instead of continuing through the normal chain at all (their own
+    # sequential predecessor gets zero gradient, since forward() discarded
+    # its value entirely -- see the default `else: err = zeros` branch
+    # below, which already produces this for free). deferred_grad holds
+    # these extra contributions until the loop reaches their target index.
     deferred_grad = [None] * len(self.layers)
 
+    def _defer_grad(target_index, grad):
+        """Add `grad` into deferred_grad[target_index] (creating it on
+        first use). Shared primitive for residual/goto/concat_at -- all
+        three ultimately just need "route this gradient to some other
+        layer's delta slot, additively.\""""
+        if deferred_grad[target_index] is None:
+            deferred_grad[target_index] = grad.copy()
+        else:
+            deferred_grad[target_index] = deferred_grad[target_index] + grad
+
     def _record_residual_grad(residual_add_layer, grad):
+        # residual's save_index points AT the residual_save marker layer
+        # itself, requiring a -1 adjustment to reach the shared tensor's
+        # actual producing layer. This is the ONLY one of these deferral
+        # helpers with that offset -- goto/concat_at name "the layer whose
+        # output is referenced" directly (no -1), see their own docstrings.
         save_index = residual_add_layer["save_index"]
         if save_index == 0:
             return  # skip connects back to the raw network input; not tracked
-        target = save_index - 1
-        if deferred_grad[target] is None:
-            deferred_grad[target] = grad.copy()
-        else:
-            deferred_grad[target] = deferred_grad[target] + grad
+        _defer_grad(save_index - 1, grad)
 
-    if self.layers and self.layers[-1]["type"] == "residual_add":
-        _record_residual_grad(self.layers[-1], self.deltas[-1])
+    def _record_goto_grad(goto_layer, grad):
+        # No -1 offset: stored_index directly names the layer whose output
+        # was jumped to (self.outputs[stored_index + 1] in Forward()).
+        # Guard stored_index < 0 (e.g. "jump to the raw network input,
+        # there's no preceding layer yet") explicitly: Python's negative
+        # indexing would otherwise silently wrap to deferred_grad[-1] (the
+        # LAST layer) instead of correctly doing nothing -- the same class
+        # of silent-corruption risk residual's `save_index == 0` guard
+        # exists to prevent.
+        stored_index = goto_layer["stored_index"]
+        if stored_index < 0:
+            return
+        _defer_grad(stored_index, grad)
+
+    def _record_concat_at_grad(concat_layer, grad):
+        # Split the incoming gradient at the recorded channel boundary
+        # (idx_a's output width) and defer each half to its source layer,
+        # no -1 offset (same direct convention as goto). Same negative-index
+        # guard as goto, per-source.
+        idx_a, idx_b = concat_layer["idx_a"], concat_layer["idx_b"]
+        width_a = self.outputs[idx_a + 1].shape[-1]
+        if idx_a >= 0:
+            _defer_grad(idx_a, grad[..., :width_a])
+        if idx_b >= 0:
+            _defer_grad(idx_b, grad[..., width_a:])
+
+    def _apply_deferral(layer, grad):
+        t = layer["type"]
+        if t == "residual_add":
+            _record_residual_grad(layer, grad)
+        elif t == "goto":
+            _record_goto_grad(layer, grad)
+        elif t == "concat_at":
+            _record_concat_at_grad(layer, grad)
+
+    # Note: cross_attention deliberately has NO special "last layer" case
+    # here (unlike residual_add/goto/concat_at below). Its KV-source
+    # deferral is driven by being `nxt` in the main loop, which already
+    # covers cross_attention as the network's very last layer too -- the
+    # main loop's l = len(self.layers) - 2 iteration always runs (as long
+    # as there are >= 2 layers) and treats nxt = self.layers[-1] normally
+    # regardless of whether -1 is "actually" the final index. Adding a
+    # special case here as well double-counts the deferral (found via FD
+    # verification: layer1's gradient came out exactly 2x too large).
+    if self.layers:
+        _apply_deferral(self.layers[-1], self.deltas[-1])
 
     for l in reversed(range(len(self.layers) - 1)):
         curr = self.layers[l]
@@ -514,7 +688,10 @@ def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_k
             err = next_delta.reshape(self.outputs[l + 1].shape)
         elif nxt["type"] == "conv2d":
             err = conv2d_backward_input(next_delta, nxt["weights"], self.outputs[l + 1].shape,
-                                        stride=nxt.get("stride", 1))
+                                        stride=nxt.get("stride", 1), pad=nxt.get("pad", 0))
+        elif nxt["type"] == "conv1d":
+            err = conv1d_backward_input(next_delta, nxt["weights"], self.outputs[l + 1].shape,
+                                        stride=nxt.get("stride", 1), pad=nxt.get("pad", 0))
         elif nxt["type"] == "maxpool2d":
             err = maxpool2d_backward(next_delta, self.outputs[l + 1], nxt["p"])
         elif nxt["type"] == "avgpool2d":
@@ -553,6 +730,15 @@ def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_k
             if cache is None:
                 raise ValueError("Attention cache is None. Ensure Forward(training=True) was called before Backward.")
             err = multihead_attention_backward(next_delta, nxt, cache)
+        elif nxt["type"] == "cross_attention":
+            cache = self.attention_cache[l + 1]
+            if cache is None:
+                raise ValueError("Cross-attention cache is None. Ensure Forward(training=True) was called before Backward.")
+            err, d_kv = cross_attention_backward(next_delta, nxt, cache)
+            # dK/dV's combined contribution has zero path back through the
+            # normal sequential chain (`err`, above, is Q's path only) --
+            # defer it entirely to the KV-source layer, no -1 offset.
+            _defer_grad(nxt["kv_source_index"], d_kv)
         elif nxt["type"] == "positional_encoding":
             err = next_delta
         elif nxt["type"] == "rnn":
@@ -563,10 +749,17 @@ def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_k
             err = gru_backward(next_delta, nxt, self.rnn_cache[l + 1])
         elif nxt["type"] in ("residual_save", "residual_add"):
             err = next_delta  # both are identity w.r.t. their own input
+        elif nxt["type"] == "reverse_sequence":
+            err = next_delta[:, ::-1, :]  # self-inverse, same op as forward
         else:
+            # Also correctly covers "goto"/"concat_at" as `nxt`: their
+            # forward() discarded whatever x was at this point entirely
+            # (replaced it with a jumped-to/concatenated value), so this
+            # layer's own sequential output has zero influence on nxt's
+            # output -- err is correctly zero, no special-casing needed.
             err = np.zeros_like(self.outputs[l + 1])
 
-        if curr["type"] in ("dense", "sparse", "conv2d"):
+        if curr["type"] in ("dense", "sparse", "conv2d", "conv1d"):
             activation_input = self.pre_activations[l+1] if self.pre_activations[l+1] is not None else self.outputs[l + 1]
             self.deltas[l] = err * derivative(curr.get("activation", "linear"), activation_input,
                                               cached_output=self.outputs[l + 1],
@@ -574,9 +767,29 @@ def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_k
         else:
             self.deltas[l] = err
 
-        if curr["type"] == "residual_add":
-            # Send this layer's gradient directly to the shared tensor the
-            # skip connection started from too (see _record_residual_grad).
-            _record_residual_grad(curr, self.deltas[l])
+        # Send this layer's gradient to wherever it needs to be deferred to
+        # (residual_add/goto/concat_at -- see _apply_deferral above; a
+        # no-op for every other layer type).
+        _apply_deferral(curr, self.deltas[l])
         if deferred_grad[l] is not None:
-            self.deltas[l] = self.deltas[l] + deferred_grad[l]
+            # deferred_grad[l] is always a gradient w.r.t. this layer's
+            # ACTIVATED output (that's what residual_add/goto/concat_at
+            # actually route -- e.g. goto's stored_index names the layer
+            # whose *output* value was jumped to). For dense/conv/conv1d
+            # layers, self.deltas[l] itself is dL/dz (PRE-activation, needed
+            # for that layer's own weight gradient) -- so the deferred
+            # contribution needs the same activation-derivative conversion
+            # applied to it before being added, or it's added in the wrong
+            # units. Matters whenever a residual/goto/concat_at target has a
+            # non-linear activation (e.g. a custom ResNet-style block whose
+            # skip connection starts at a `tanh` dense layer, not just the
+            # `linear` targets every in-repo transformer block happens to use).
+            if curr["type"] in ("dense", "sparse", "conv2d", "conv1d"):
+                activation_input = self.pre_activations[l+1] if self.pre_activations[l+1] is not None else self.outputs[l + 1]
+                deferred_contribution = deferred_grad[l] * derivative(
+                    curr.get("activation", "linear"), activation_input,
+                    cached_output=self.outputs[l + 1], **curr.get("activation_params", {})
+                )
+            else:
+                deferred_contribution = deferred_grad[l]
+            self.deltas[l] = self.deltas[l] + deferred_contribution

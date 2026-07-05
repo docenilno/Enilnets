@@ -81,8 +81,9 @@ def Reinforce(self, states, actions, returns, action_type="discrete", std=1.0, n
     self.update()
     return float(np.mean(returns_raw))
 
-def PPO(self, states, actions, old_log_probs, advantages, action_type="discrete", 
-        epsilon=0.2, std=1.0, value_targets=None, value_coeff=0.5, entropy_coeff=0.01):
+def PPO(self, states, actions, old_log_probs, advantages, action_type="discrete",
+        epsilon=0.2, std=1.0, value_targets=None, value_coeff=0.5, entropy_coeff=0.01,
+        value_network=None):
     """
     Proximal Policy Optimization (PPO) update.
 
@@ -104,11 +105,18 @@ def PPO(self, states, actions, old_log_probs, advantages, action_type="discrete"
     std : float
         Fixed standard deviation for continuous Gaussian policy
     value_targets : ndarray or None
-        Target values for value function (if network has value head)
+        Target values for the value function. Only used if `value_network`
+        is also given -- otherwise accepted but ignored (no value head on
+        `self` to train against it).
     value_coeff : float
         Coefficient for value loss
     entropy_coeff : float
         Coefficient for entropy bonus
+    value_network : NeuralNet or None
+        Optional separate value-function network (same input dim as the
+        policy `self`, output dim 1, linear activation). When given together
+        with `value_targets`, it's trained via MSE*value_coeff right after
+        the policy update.
     """
     states = np.asarray(states, dtype=np.float64)
     actions = np.asarray(actions)
@@ -162,6 +170,13 @@ def PPO(self, states, actions, old_log_probs, advantages, action_type="discrete"
 
     self.Backward(None, output_delta=output_delta)
     self.update()
+
+    if value_network is not None and value_targets is not None:
+        value_targets = np.asarray(value_targets, dtype=np.float64).reshape(-1, 1)
+        value_pred = value_network.Forward(states, training=True)
+        value_delta = value_coeff * 2 * (value_pred - value_targets) / batch_size
+        value_network.Backward(None, output_delta=value_delta)
+        value_network.update()
 
     return float(np.mean(policy_loss))
 

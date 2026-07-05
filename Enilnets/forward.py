@@ -15,6 +15,51 @@ def im2col(input_data, filter_h, filter_w, stride=1, pad=0):
     col = np.lib.stride_tricks.as_strided(img, shape=shape, strides=strides)
     return col.transpose(0, 4, 5, 1, 2, 3).reshape(N * out_h * out_w, -1)
 
+def im2col1d(input_data, filter_k, stride=1, pad=0):
+    N, C, L = input_data.shape
+    out_l = (L + 2 * pad - filter_k) // stride + 1
+    img = np.pad(input_data, [(0, 0), (0, 0), (pad, pad)], mode='constant')
+
+    N_stride, C_stride, L_stride = img.strides
+    shape = (N, C, filter_k, out_l)
+    strides = (N_stride, C_stride, L_stride, L_stride * stride)
+
+    col = np.lib.stride_tricks.as_strided(img, shape=shape, strides=strides)
+    return col.transpose(0, 3, 1, 2).reshape(N * out_l, -1)
+
+def _rope_cos_sin(S, head_dim, base):
+    """Standard RoPE angles: theta_i = base**(-2i/head_dim) for i in
+    0..head_dim/2-1, applied at integer positions 0..S-1. Returns
+    (cos, sin), each (S, head_dim/2) -- broadcasts directly against a
+    (..., S, head_dim/2) array (numpy aligns trailing dims)."""
+    half = head_dim // 2
+    theta = base ** (-2.0 * np.arange(half) / head_dim)
+    pos = np.arange(S, dtype=np.float64)
+    angles = pos[:, None] * theta[None, :]
+    return np.cos(angles), np.sin(angles)
+
+def _rope_rotate(x, cos, sin):
+    """Rotate the last axis of `x` (..., head_dim) by per-position-pair
+    angles (the "rotate_half" formulation used by most modern RoPE
+    implementations -- mathematically equivalent to the interleaved-pairs
+    formulation up to a fixed permutation of head_dim, which cancels out
+    since it's applied identically to Q and K before their dot product)."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return np.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+
+def _alibi_slopes(num_heads):
+    """Standard ALiBi geometric-sequence per-head slopes."""
+    def slopes_pow2(n):
+        start = 2.0 ** (-8.0 / n)
+        return [start ** (i + 1) for i in range(n)]
+    if (num_heads & (num_heads - 1)) == 0:  # power of 2
+        return np.array(slopes_pow2(num_heads))
+    closest_pow2 = 2 ** int(np.floor(np.log2(num_heads)))
+    slopes = slopes_pow2(closest_pow2)
+    extra = slopes_pow2(2 * closest_pow2)[0::2][: num_heads - closest_pow2]
+    return np.array(slopes + extra)
+
 def batchnorm_forward(x, layer, training):
     epsilon = layer.get("epsilon", 1e-5)
     momentum = layer.get("momentum", 0.1)
@@ -113,13 +158,30 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
             B, C, H, W = x.shape
             F, _, K, _ = layer["weights"].shape
             stride = layer.get("stride", 1)
-            out_h, out_w = (H - K) // stride + 1, (W - K) // stride + 1
-            col = im2col(x, K, K, stride=stride)
+            pad = layer.get("pad", 0)
+            out_h, out_w = (H + 2 * pad - K) // stride + 1, (W + 2 * pad - K) // stride + 1
+            col = im2col(x, K, K, stride=stride, pad=pad)
             conv_cache_entry = col
             weights_flat = layer["weights"].reshape(F, -1)
             out = np.dot(col.astype(compute_dtype), weights_flat.astype(compute_dtype).T) \
                 .astype(np.float64).reshape(B, out_h, out_w, F).transpose(0, 3, 1, 2)
             z = out + layer["bias"][None, :, None, None]
+            x = activate(layer["activation"], z, **layer.get("activation_params", {}))
+            self.pre_activations.append(z)
+            self.batchnorm_cache.append(None)
+            self.layernorm_cache.append(None)
+        elif layer["type"] == "conv1d":
+            B, C, L = x.shape
+            F, _, K = layer["weights"].shape
+            stride = layer.get("stride", 1)
+            pad = layer.get("pad", 0)
+            out_l = (L + 2 * pad - K) // stride + 1
+            col = im2col1d(x, K, stride=stride, pad=pad)
+            conv_cache_entry = col
+            weights_flat = layer["weights"].reshape(F, -1)
+            out = np.dot(col.astype(compute_dtype), weights_flat.astype(compute_dtype).T) \
+                .astype(np.float64).reshape(B, out_l, F).transpose(0, 2, 1)
+            z = out + layer["bias"][None, :, None]
             x = activate(layer["activation"], z, **layer.get("activation_params", {}))
             self.pre_activations.append(z)
             self.batchnorm_cache.append(None)
@@ -203,7 +265,27 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
             Kh = K.reshape(B, S, H, Dh).transpose(0, 2, 1, 3)
             Vh = V.reshape(B, S, H, Dh).transpose(0, 2, 1, 3)
 
-            scores = np.matmul(Qh, Kh.transpose(0, 1, 3, 2)) / np.sqrt(Dh)
+            positional_scheme = layer.get("positional_scheme", "absolute")
+            if positional_scheme == "rope":
+                # Rotate Q/K (not V) per head before the score dot product.
+                # Computed lazily from runtime S, like the causal mask below.
+                rope_cos, rope_sin = _rope_cos_sin(S, Dh, constants.SINUSOIDAL_BASE)
+                Qh_scored = _rope_rotate(Qh, rope_cos, rope_sin)
+                Kh_scored = _rope_rotate(Kh, rope_cos, rope_sin)
+            else:
+                Qh_scored, Kh_scored = Qh, Kh
+
+            scores = np.matmul(Qh_scored, Kh_scored.transpose(0, 1, 3, 2)) / np.sqrt(Dh)
+            if positional_scheme == "alibi":
+                # Static per-head linear-distance bias -- no extra params,
+                # no backward-pass change needed (constant w.r.t. Q/K/V,
+                # exactly like the causal mask below).
+                slopes = _alibi_slopes(H)
+                positions = np.arange(S)
+                diff = positions[:, None] - positions[None, :]  # (S, S), i - j
+                distance = diff if layer.get("causal", False) else np.abs(diff)
+                alibi_bias = -slopes[:, None, None] * distance[None, :, :]
+                scores = scores + alibi_bias[None, :, :, :]
             if layer.get("causal", False):
                 # Position i may only attend to positions <= i (autoregressive
                 # language modeling). No backward-pass changes are needed for
@@ -219,7 +301,38 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
             context = context.transpose(0, 2, 1, 3).reshape(B, S, E)
             x = np.dot(context, layer["Wo"].T) + layer["bo"]
 
-            attn_cache_entry = (Q, K, V, Qh, Kh, Vh, attn, context, x_in)
+            attn_cache_entry = (Q, K, V, Qh_scored, Kh_scored, Vh, attn, context, x_in)
+            self.pre_activations.append(None)
+            self.batchnorm_cache.append(None)
+            self.layernorm_cache.append(None)
+        elif layer["type"] == "cross_attention":
+            # Q from the normal sequential x; K/V from an earlier layer's
+            # output (kv_source_index, direct convention like "goto"/
+            # "concat_at", NOT residual's -1-adjusted save_index).
+            x_in = x
+            kv_source = self.outputs[layer["kv_source_index"] + 1]
+            B, Sq, E = x_in.shape
+            Skv = kv_source.shape[1]
+            H = layer["num_heads"]
+            Dh = layer["head_dim"]
+            Q = np.dot(x_in, layer["Wq"].T) + layer["bq"]
+            K = np.dot(kv_source, layer["Wk"].T) + layer["bk"]
+            V = np.dot(kv_source, layer["Wv"].T) + layer["bv"]
+
+            Qh = Q.reshape(B, Sq, H, Dh).transpose(0, 2, 1, 3)
+            Kh = K.reshape(B, Skv, H, Dh).transpose(0, 2, 1, 3)
+            Vh = V.reshape(B, Skv, H, Dh).transpose(0, 2, 1, 3)
+
+            scores = np.matmul(Qh, Kh.transpose(0, 1, 3, 2)) / np.sqrt(Dh)
+            scores_max = np.max(scores, axis=-1, keepdims=True)
+            exp_scores = np.exp(scores - scores_max)
+            attn = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+
+            context = np.matmul(attn, Vh)
+            context = context.transpose(0, 2, 1, 3).reshape(B, Sq, E)
+            x = np.dot(context, layer["Wo"].T) + layer["bo"]
+
+            attn_cache_entry = (Q, K, V, Qh, Kh, Vh, attn, context, x_in, kv_source)
             self.pre_activations.append(None)
             self.batchnorm_cache.append(None)
             self.layernorm_cache.append(None)
@@ -307,6 +420,35 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
             self.layernorm_cache.append(None)
         elif layer["type"] == "residual_add":
             x = x + self.outputs[layer["save_index"]]
+            self.pre_activations.append(None)
+            self.batchnorm_cache.append(None)
+            self.layernorm_cache.append(None)
+        elif layer["type"] == "goto":
+            # Jumps to an earlier layer's output, REPLACING x entirely
+            # (unlike residual_add, which adds). Indexing convention:
+            # stored_index names "the layer whose output is referenced"
+            # directly -- self.outputs[stored_index + 1] is the target, no
+            # -1 adjustment (unlike residual's save_index, which points AT
+            # the residual_save marker layer itself).
+            x = self.outputs[layer["stored_index"] + 1]
+            self.pre_activations.append(None)
+            self.batchnorm_cache.append(None)
+            self.layernorm_cache.append(None)
+        elif layer["type"] == "concat_at":
+            # Concatenates two earlier layers' outputs along the feature
+            # axis, REPLACING x (same non-additive, index-direct convention
+            # as "goto"). Used to join bidirectional RNN directions.
+            x = np.concatenate(
+                [self.outputs[layer["idx_a"] + 1], self.outputs[layer["idx_b"] + 1]], axis=-1
+            )
+            self.pre_activations.append(None)
+            self.batchnorm_cache.append(None)
+            self.layernorm_cache.append(None)
+        elif layer["type"] == "reverse_sequence":
+            # Reverses the sequence (time) axis -- a plain sequential
+            # passthrough layer (not multi-source), self-inverse in
+            # backward too.
+            x = x[:, ::-1, :]
             self.pre_activations.append(None)
             self.batchnorm_cache.append(None)
             self.layernorm_cache.append(None)

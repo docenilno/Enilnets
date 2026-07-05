@@ -77,6 +77,19 @@ def multimodal_fusion(embeddings_list, fusion_type="concat", weights=None):
             fused += w * emb
         return fused
 
+    elif fusion_type == "attention":
+        # Data-dependent attention over modalities: each sample gets its own
+        # weighting (unlike "gated"'s static per-modality weights), based on
+        # how well each modality's embedding agrees with the cross-modality
+        # mean for that sample.
+        stacked = np.stack(embeddings_list, axis=0)  # (M, N, D)
+        query = stacked.mean(axis=0, keepdims=True)
+        scores = np.sum(stacked * query, axis=-1) / np.sqrt(stacked.shape[-1])
+        scores -= scores.max(axis=0, keepdims=True)
+        attn = np.exp(scores) / np.sum(np.exp(scores), axis=0, keepdims=True)
+        fused = np.sum(stacked * attn[:, :, None], axis=0)
+        return fused
+
     elif fusion_type == "gated":
         if weights is None:
             weights = [1.0 / len(embeddings_list)] * len(embeddings_list)

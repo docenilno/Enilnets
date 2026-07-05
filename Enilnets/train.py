@@ -50,15 +50,26 @@ def compute_precision_recall_f1(self, predictions, targets):
 
 def Train(self, X_train, Y_train, epochs=10, batch_size=32, X_val=None, Y_val=None,
           loss_function=None, verbose=True, scheduler=None, early_stopping=None,
-          accumulation_steps=1, **loss_kwargs):
+          accumulation_steps=1, callbacks=None, **loss_kwargs):
     """early_stopping: optional Enilnets.EarlyStopping instance monitoring
     val_loss (if X_val/Y_val given) or train loss otherwise; training stops
-    as soon as early_stopping.step(...) returns True."""
+    as soon as early_stopping.step(...) returns True.
+
+    callbacks: optional list of duck-typed callback objects. No shared base
+    class -- implement whichever of these your callback needs:
+      on_epoch_end(epoch, logs, model=self) -- called once per epoch, right
+        after `history` is updated and before the early-stopping check.
+        `logs` is a dict with this epoch's "loss"/"accuracy"/"lr" and, if
+        validation data was given, "val_loss"/"val_accuracy".
+      on_train_end(history) -- called once after the epoch loop ends
+        (whether by exhausting `epochs` or by early stopping).
+    Missing methods are simply skipped (no error)."""
     history = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": [], "lr": []}
     n_samples = X_train.shape[0]
+    prev_metric = None
     for epoch in range(epochs):
         if scheduler is not None:
-            lr = scheduler.step(epoch)
+            lr = scheduler.step(epoch, metric=prev_metric)
             self.set_lr(lr)
 
         epoch_loss = 0.0
@@ -89,21 +100,43 @@ def Train(self, X_train, Y_train, epochs=10, batch_size=32, X_val=None, Y_val=No
             if verbose:
                 print(f"Epoch {epoch+1}/{epochs} - loss: {avg_loss:.4f} - acc: {avg_acc:.4f} - lr: {self.learning_rate:.6f}")
             monitored = avg_loss
+        prev_metric = monitored
+
+        logs = {"loss": avg_loss, "accuracy": avg_acc, "lr": self.learning_rate}
+        if X_val is not None and Y_val is not None:
+            logs["val_loss"] = val_loss
+            logs["val_accuracy"] = val_acc
+        for cb in (callbacks or []):
+            getattr(cb, "on_epoch_end", lambda *a, **k: None)(epoch, logs, model=self)
 
         if early_stopping is not None and early_stopping.step(monitored):
             if verbose:
                 print(f"Early stopping at epoch {epoch+1} (no improvement for {early_stopping.patience} epochs)")
             break
+    for cb in (callbacks or []):
+        getattr(cb, "on_train_end", lambda *a, **k: None)(history)
     return history
 
 class LRScheduler:
-    """Learning rate schedulers."""
+    """Learning rate schedulers.
+
+    mode="plateau": real ReduceLROnPlateau. kwargs: factor (default 0.5),
+    patience (default 10), min_delta (default 0.0), metric_mode ("min",
+    default, or "max" -- NOT `mode`, which is taken by the schedule-name
+    param). Call step(epoch, metric=...) every epoch with the just-finished
+    epoch's monitored value (Train() does this automatically, with a
+    one-epoch lag so the LR used *during* an epoch reflects metrics known
+    *before* it started).
+    """
     def __init__(self, initial_lr, mode="step", **kwargs):
         self.initial_lr = initial_lr
         self.mode = mode
         self.kwargs = kwargs
+        self._plateau_lr = initial_lr
+        self._plateau_best = None
+        self._plateau_bad_epochs = 0
 
-    def step(self, epoch):
+    def step(self, epoch, metric=None):
         if self.mode == "step":
             drop = self.kwargs.get("drop", 0.5)
             epochs_drop = self.kwargs.get("epochs_drop", 10)
@@ -122,7 +155,28 @@ class LRScheduler:
             else:
                 return self.initial_lr * 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (max_epochs - warmup_epochs)))
         elif self.mode == "plateau":
-            # Requires history tracking externally; simplified here
-            return self.initial_lr
+            if metric is None:
+                return self._plateau_lr
+            factor = self.kwargs.get("factor", 0.5)
+            patience = self.kwargs.get("patience", 10)
+            min_delta = self.kwargs.get("min_delta", 0.0)
+            metric_mode = self.kwargs.get("metric_mode", "min")
+
+            if self._plateau_best is None:
+                is_improvement = True
+            elif metric_mode == "min":
+                is_improvement = metric < self._plateau_best - min_delta
+            else:
+                is_improvement = metric > self._plateau_best + min_delta
+
+            if is_improvement:
+                self._plateau_best = metric
+                self._plateau_bad_epochs = 0
+            else:
+                self._plateau_bad_epochs += 1
+                if self._plateau_bad_epochs >= patience:
+                    self._plateau_lr *= factor
+                    self._plateau_bad_epochs = 0
+            return self._plateau_lr
         else:
             return self.initial_lr

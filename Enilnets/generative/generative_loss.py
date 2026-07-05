@@ -91,7 +91,15 @@ def perceptual_loss(x, y, feature_extractor=None):
     feat_y = feature_extractor(y)
     return float(np.mean((feat_x - feat_y) ** 2))
 
-def vgg_loss(x, y):
-    """Placeholder for VGG-based perceptual loss."""
-    # In a full implementation, would use a VGG network
-    return float(np.mean((x - y) ** 2))
+def vgg_loss(x, y, vgg_features=None):
+    """VGG-based perceptual loss. `vgg_features` is any callable duck-typing
+    to `feature_extractor(x) -> features` (e.g.
+    `generative.pretrained.build_vgg16_feature_extractor(...).Forward`, with
+    your own converted pretrained weights loaded via `.set_weights()` --
+    Enilnets never downloads weights itself). Falls back to plain MSE on the
+    raw inputs if not given, mirroring `perceptual_loss`."""
+    if vgg_features is None:
+        return float(np.mean((x - y) ** 2))
+    feat_x = vgg_features(x)
+    feat_y = vgg_features(y)
+    return float(np.mean((feat_x - feat_y) ** 2))

@@ -7,7 +7,7 @@ import numpy as np
 from . import constants
 
 def add_transformer_block(self, embed_dim=None, num_heads=4, mlp_ratio=4.0, dropout=0.0, activation="swish",
-                           causal=False):
+                           causal=False, positional_scheme="absolute"):
     """
     Add a full Transformer block: LayerNorm -> Attention -> LayerNorm -> MLP.
 
@@ -23,6 +23,9 @@ def add_transformer_block(self, embed_dim=None, num_heads=4, mlp_ratio=4.0, drop
     causal : bool
         If True, use a causal (autoregressive) self-attention mask -- for
         GPT-style decoders / language models.
+    positional_scheme : str
+        Forwarded to add_multihead_attention: "absolute" (default), "rope",
+        or "alibi".
 
     Notes
     -----
@@ -36,7 +39,7 @@ def add_transformer_block(self, embed_dim=None, num_heads=4, mlp_ratio=4.0, drop
     # Pre-norm: x = x + Attention(LayerNorm(x))
     self.add_residual_start()
     self.add_layernorm((embed_dim,))
-    self.add_multihead_attention(embed_dim, num_heads, dropout, causal=causal)
+    self.add_multihead_attention(embed_dim, num_heads, dropout, causal=causal, positional_scheme=positional_scheme)
     self.add_residual_end()
 
     # Pre-norm: x = x + MLP(LayerNorm(x))
@@ -102,6 +105,7 @@ def add_positional_encoding(self, max_seq_len, embed_dim=None, learnable=True, b
         })
         self._last_width = embed_dim
         self._last_spatial = None
+        self._last_spatial_1d = None
 
 def add_vision_transformer_patch_embed(self, img_size, patch_size, in_channels=None, embed_dim=768):
     """

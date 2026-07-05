@@ -31,7 +31,7 @@ def activate(name, x, alpha=None, sigmoid_clip=None):
         return e_x / np.sum(e_x, axis=-1, keepdims=True)
     if name == "softplus": return np.log(1 + np.exp(np.clip(x, -clip, clip)))
     if name == "linear": return x
-    return x
+    raise ValueError(f"Unknown activation: {name!r}")
 
 def derivative(name, x, alpha=None, sigmoid_clip=None, cached_output=None):
     """Derivative of an activation function w.r.t. its pre-activation input x.
@@ -74,4 +74,4 @@ def derivative(name, x, alpha=None, sigmoid_clip=None, cached_output=None):
         return 1 - t ** 2
     if name == "softplus": return 1.0 / (1.0 + np.exp(-np.clip(x, -clip, clip)))
     if name == "linear": return np.ones_like(x)
-    return np.ones_like(x)
+    raise ValueError(f"Unknown activation: {name!r}")

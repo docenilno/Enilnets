@@ -1,6 +1,7 @@
 import numpy as np
 from ..base import NeuralNet
 from .sampling import gaussian_sample
+from ._shared import _manual_sequential_backward
 
 class DiffusionModel:
     def __init__(self, data_shape, time_steps=1000, beta_schedule="linear",
@@ -9,7 +10,8 @@ class DiffusionModel:
                  optimizer="adam", l2_lambda=0.0,
                  use_ema=True, ema_decay=0.999,
                  cosine_schedule_s=0.008, beta_clip=(0, 0.999),
-                 time_emb_dim=128, sample_clip_range=(-1.0, 1.0)):
+                 time_emb_dim=128, sample_clip_range=(-1.0, 1.0),
+                 num_classes=None):
         self.data_shape = data_shape
         self.time_steps = time_steps
         self.denoiser_type = denoiser_type
@@ -18,6 +20,8 @@ class DiffusionModel:
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.sample_clip_range = sample_clip_range
+        self.num_classes = num_classes
+        cond_dim = num_classes if num_classes is not None else 0
 
         # Noise schedule
         if beta_schedule == "linear":
@@ -45,17 +49,18 @@ class DiffusionModel:
         self.denoiser = NeuralNet(learning_rate=learning_rate, optimizer=optimizer, l2_lambda=l2_lambda)
 
         if denoiser_type == "mlp":
-            input_dim = self.data_dim + self.time_emb_dim
+            input_dim = self.data_dim + self.time_emb_dim + cond_dim
             prev = input_dim
             for h in denoiser_hidden:
                 self.denoiser.add_dense(prev, h, activation="swish")
                 prev = h
             self.denoiser.add_dense(prev, self.data_dim, activation="linear")
         elif denoiser_type == "conv":
-            # Time embedding is broadcast spatially and concatenated as extra
-            # input channels (see _predict_noise), hence the +time_emb_dim.
+            # Time embedding (and, if class-conditional, a one-hot label) is
+            # broadcast spatially and concatenated as extra input channels
+            # (see _predict_noise), hence the +time_emb_dim (+cond_dim).
             C, H, W = data_shape
-            self.denoiser.add_conv2d(C + self.time_emb_dim, 64, k=3, activation="swish")
+            self.denoiser.add_conv2d(C + self.time_emb_dim + cond_dim, 64, k=3, activation="swish")
             self.denoiser.add_conv2d(64, 128, k=3, activation="swish")
             self.denoiser.add_conv2d(128, 64, k=3, activation="swish")
             self.denoiser.add_conv2d(64, C, k=3, activation="linear")
@@ -89,6 +94,23 @@ class DiffusionModel:
             self.denoiser.set_weights(self._original_weights)
             del self._original_weights
 
+    def _onehot(self, y, n):
+        """Validate `y` against `self.num_classes` (raises if one is given
+        without the other) and return a one-hot (n, num_classes) array, or
+        None if this DiffusionModel is unconditional."""
+        if self.num_classes is None:
+            if y is not None:
+                raise ValueError("This DiffusionModel was built without num_classes -- don't pass y/labels.")
+            return None
+        if y is None:
+            raise ValueError("This DiffusionModel was built with num_classes=... -- y/labels is required.")
+        y = np.asarray(y).reshape(-1)
+        if y.shape[0] == 1 and n > 1:
+            y = np.repeat(y, n)
+        if y.shape[0] != n:
+            raise ValueError(f"y has {y.shape[0]} labels but batch size is {n}")
+        return np.eye(self.num_classes, dtype=np.float64)[y]
+
     def _time_embedding(self, t):
         t = np.asarray(t, dtype=np.float64).reshape(-1)
         half = self.time_emb_dim // 2
@@ -107,16 +129,18 @@ class DiffusionModel:
         x_t = sqrt_acp * x_0 + sqrt_omacp * noise
         return x_t, noise
 
-    def _predict_noise(self, x_t, t, use_ema=True):
+    def _predict_noise(self, x_t, t, use_ema=True, y=None):
         """Predict the noise added to x_t at timestep t. use_ema=True during
         sampling/denoising; False during training (uses live weights)."""
         if use_ema and self.use_ema:
             self._use_ema_weights(True)
         try:
+            onehot = self._onehot(y, x_t.shape[0])
             if self.denoiser_type == "mlp":
                 x_t_flat = x_t.reshape(x_t.shape[0], -1)
                 t_emb = self._time_embedding(t)
-                inp = np.concatenate([x_t_flat, t_emb], axis=1)
+                parts = [x_t_flat, t_emb] + ([onehot] if onehot is not None else [])
+                inp = np.concatenate(parts, axis=1)
                 result = self.denoiser.Forward(inp, training=True).reshape(x_t.shape)
             elif self.denoiser_type == "conv":
                 t_emb = self._time_embedding(t)  # (B, time_emb_dim)
@@ -124,79 +148,58 @@ class DiffusionModel:
                 # Broadcast time embedding to spatial dimensions
                 t_spatial = t_emb.reshape(B, self.time_emb_dim, 1, 1)
                 t_spatial = np.repeat(np.repeat(t_spatial, H, axis=2), W, axis=3)
-                # Concatenate time channels with image channels
-                inp = np.concatenate([x_t, t_spatial], axis=1)  # (B, C+time_emb_dim, H, W)
+                channel_parts = [x_t, t_spatial]
+                if onehot is not None:
+                    # Broadcast the one-hot label spatially, same as the
+                    # time embedding above.
+                    y_spatial = onehot.reshape(B, self.num_classes, 1, 1)
+                    y_spatial = np.repeat(np.repeat(y_spatial, H, axis=2), W, axis=3)
+                    channel_parts.append(y_spatial)
+                inp = np.concatenate(channel_parts, axis=1)  # (B, C+time_emb_dim(+num_classes), H, W)
                 result = self.denoiser.Forward(inp, training=True)
         finally:
             if use_ema and self.use_ema:
                 self._use_ema_weights(False)
         return result
 
-    def train_step(self, x_0):
+    def train_step(self, x_0, y=None):
         x_0 = np.asarray(x_0, dtype=np.float64)
         batch_size = x_0.shape[0]
 
         t = np.random.randint(0, self.time_steps, size=batch_size)
         x_t, noise = self._forward_diffusion(x_0, t)
-        pred_noise = self._predict_noise(x_t, t, use_ema=False)  # train on current weights
+        pred_noise = self._predict_noise(x_t, t, use_ema=False, y=y)  # train on current weights
 
         loss = np.mean((pred_noise - noise) ** 2)
 
         delta = 2 * (pred_noise - noise) / batch_size
         if self.denoiser_type == "mlp":
-            self.denoiser.Backward(np.zeros((batch_size, self.data_dim)))
-            self.denoiser.deltas[-1] = delta.reshape(batch_size, -1)
-            for l in range(len(self.denoiser.layers) - 2, -1, -1):
-                nxt = self.denoiser.layers[l + 1]
-                next_delta = self.denoiser.deltas[l + 1]
-                if nxt["type"] in ("dense", "sparse"):
-                    err = np.dot(next_delta, nxt["weights"])
-                else:
-                    err = next_delta
-                curr = self.denoiser.layers[l]
-                if curr["type"] in ("dense", "sparse", "conv2d"):
-                    from ..activations import derivative
-                    activation_input = self.denoiser.pre_activations[l+1] if self.denoiser.pre_activations[l+1] is not None else self.denoiser.outputs[l+1]
-                    self.denoiser.deltas[l] = err * derivative(curr.get("activation", "linear"), activation_input)
-                else:
-                    self.denoiser.deltas[l] = err
-            self.denoiser.update()
+            _manual_sequential_backward(self.denoiser, delta.reshape(batch_size, -1))
         elif self.denoiser_type == "conv":
-            self.denoiser.Backward(np.zeros_like(x_t))
-            self.denoiser.deltas[-1] = delta
-            for l in range(len(self.denoiser.layers) - 2, -1, -1):
-                nxt = self.denoiser.layers[l + 1]
-                next_delta = self.denoiser.deltas[l + 1]
-                if nxt["type"] in ("dense", "sparse"):
-                    err = np.dot(next_delta, nxt["weights"])
-                elif nxt["type"] == "conv2d":
-                    from ..backward import conv2d_backward_input
-                    err = conv2d_backward_input(next_delta, nxt["weights"], self.denoiser.outputs[l+1].shape)
-                else:
-                    err = next_delta
-                curr = self.denoiser.layers[l]
-                if curr["type"] in ("dense", "sparse", "conv2d"):
-                    from ..activations import derivative
-                    activation_input = self.denoiser.pre_activations[l+1] if self.denoiser.pre_activations[l+1] is not None else self.denoiser.outputs[l+1]
-                    self.denoiser.deltas[l] = err * derivative(curr.get("activation", "linear"), activation_input)
-                else:
-                    self.denoiser.deltas[l] = err
-            self.denoiser.update()
+            _manual_sequential_backward(self.denoiser, delta)
+        self.denoiser.update()
 
         self._update_ema()
 
         return loss
 
-    def Train(self, X_train, epochs=10, batch_size=64, verbose=True):
+    def Train(self, X_train, epochs=10, batch_size=64, verbose=True, y_train=None):
         X = np.asarray(X_train, dtype=np.float64)
         n_samples = X.shape[0]
+        y_arr = None
+        if y_train is not None:
+            y_arr = np.asarray(y_train).reshape(-1)
+            if y_arr.shape[0] != n_samples:
+                raise ValueError(f"y_train has {y_arr.shape[0]} labels but X_train has {n_samples} samples")
         history = []
         for epoch in range(epochs):
             indices = np.random.permutation(n_samples)
             epoch_loss = 0.0
             for i in range(0, n_samples, batch_size):
-                batch = X[indices[i:i+batch_size]]
-                loss = self.train_step(batch)
+                batch_idx = indices[i:i+batch_size]
+                batch = X[batch_idx]
+                batch_y = y_arr[batch_idx] if y_arr is not None else None
+                loss = self.train_step(batch, y=batch_y)
                 epoch_loss += loss * batch.shape[0]
             avg_loss = epoch_loss / n_samples
             history.append(avg_loss)
@@ -204,7 +207,7 @@ class DiffusionModel:
                 print(f"Epoch {epoch+1}/{epochs} - Diffusion loss: {avg_loss:.6f}")
         return history
 
-    def sample(self, n_samples=16, shape=None, clip=True):
+    def sample(self, n_samples=16, shape=None, clip=True, y=None):
         if shape is None:
             shape = self.data_shape
 
@@ -216,7 +219,7 @@ class DiffusionModel:
         for t_step in reversed(range(self.time_steps)):
             t = np.full(n_samples, t_step, dtype=np.int64)
 
-            pred_noise = self._predict_noise(x, t, use_ema=True)
+            pred_noise = self._predict_noise(x, t, use_ema=True, y=y)
 
             alpha_t = self.alphas[t].reshape(-1, *([1] * (x.ndim - 1)))
             alpha_cumprod_t = self.alphas_cumprod[t].reshape(-1, *([1] * (x.ndim - 1)))
@@ -237,11 +240,50 @@ class DiffusionModel:
             x = np.clip(x, self.sample_clip_range[0], self.sample_clip_range[1])
         return x
 
-    def denoise(self, x_noisy, t_start, t_end=0):
+    def sample_ddim(self, n_samples=16, n_steps=50, eta=0.0, shape=None, clip=True, y=None):
+        """DDIM fast sampling: `n_steps` denoiser forward-passes over a
+        strided subsequence of the full `time_steps` schedule, instead of
+        `sample()`'s `time_steps` full ancestral-sampling steps.
+        `eta=0.0` (default) is fully deterministic; `eta=1.0` reproduces
+        `sample()`'s DDPM-like stochastic behavior at each subsequence step.
+        """
+        if shape is None:
+            shape = self.data_shape
+        x = np.random.randn(n_samples, *shape)
+
+        # Strided descending timestep subsequence, e.g. n_steps=50 out of
+        # time_steps=1000 -> roughly every 20th timestep.
+        steps = np.unique(np.linspace(0, self.time_steps - 1, n_steps).astype(int))[::-1]
+
+        for i, t_step in enumerate(steps):
+            t = np.full(n_samples, t_step, dtype=np.int64)
+            pred_noise = self._predict_noise(x, t, use_ema=True, y=y)
+
+            alpha_cumprod_t = self.alphas_cumprod[t_step]
+            alpha_cumprod_prev = self.alphas_cumprod[steps[i + 1]] if i < len(steps) - 1 else 1.0
+
+            x0_pred = (x - np.sqrt(1.0 - alpha_cumprod_t) * pred_noise) / np.sqrt(alpha_cumprod_t)
+            if clip:
+                x0_pred = np.clip(x0_pred, self.sample_clip_range[0], self.sample_clip_range[1])
+
+            sigma_t = eta * np.sqrt(
+                (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod_t)
+            ) * np.sqrt(1.0 - alpha_cumprod_t / alpha_cumprod_prev) if alpha_cumprod_prev < 1.0 else 0.0
+            dir_coeff = np.sqrt(max(0.0, 1.0 - alpha_cumprod_prev - sigma_t ** 2))
+
+            x = np.sqrt(alpha_cumprod_prev) * x0_pred + dir_coeff * pred_noise
+            if sigma_t > 0:
+                x = x + sigma_t * np.random.randn(*x.shape)
+
+        if clip:
+            x = np.clip(x, self.sample_clip_range[0], self.sample_clip_range[1])
+        return x
+
+    def denoise(self, x_noisy, t_start, t_end=0, y=None):
         x = x_noisy.copy()
         for t_step in reversed(range(t_end, t_start)):
             t = np.full(x.shape[0], t_step, dtype=np.int64)
-            pred_noise = self._predict_noise(x, t, use_ema=True)
+            pred_noise = self._predict_noise(x, t, use_ema=True, y=y)
 
             alpha_t = self.alphas[t].reshape(-1, *([1] * (x.ndim - 1)))
             alpha_cumprod_t = self.alphas_cumprod[t].reshape(-1, *([1] * (x.ndim - 1)))
