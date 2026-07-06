@@ -11,6 +11,9 @@ Usage:
     python test_enilnets.py -v              # verbose
     python test_enilnets.py TestVAE          # run one class
     python test_enilnets.py --benchmark      # run only the Benchmark* classes
+    python test_enilnets.py --gpu            # run with Enilnets.use_gpu(True)
+    python test_enilnets.py --float64        # run with Enilnets.use_float64(True)
+    python test_enilnets.py --gpu --float64 --benchmark  # any combination
 """
 
 import sys
@@ -19,10 +22,20 @@ import unittest
 import tempfile
 import os
 import warnings
-import numpy as np
+import contextlib
+import statistics
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+import Enilnets
+if "--gpu" in sys.argv:
+    sys.argv.remove("--gpu")
+    Enilnets.use_gpu(True)
+if "--float64" in sys.argv:
+    sys.argv.remove("--float64")
+    Enilnets.use_float64(True)
+
+from Enilnets.backend import np
 from Enilnets import NeuralNet, LRScheduler, TextGenerator, Tokenizer
 from Enilnets.generative import (
     VAE, GAN, DiffusionModel, AutoregressiveModel,
@@ -54,6 +67,39 @@ from Enilnets import (
 # ========================================================================
 # Helpers
 # ========================================================================
+
+class _FDPrecisionMixin:
+    """Mixin for test classes built around finite-difference numerical
+    gradient checks. Forces float64 for the whole class's duration
+    regardless of the library's ambient default dtype: FD checks at
+    eps=1e-5/1e-6 rely on subtractive cancellation that float32's ~7
+    decimal digits can't resolve reliably, so these specific
+    gradient-correctness checks always run at float64 -- unrelated to
+    whether the rest of the suite is exercising the float32 default or
+    the --float64 opt-in pass."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._prev_float64 = Enilnets.is_float64_enabled()
+        Enilnets.use_float64(True)
+
+    @classmethod
+    def tearDownClass(cls):
+        Enilnets.use_float64(cls._prev_float64)
+
+
+@contextlib.contextmanager
+def _force_float64():
+    """Same rationale as _FDPrecisionMixin, scoped to a single test method
+    instead of a whole class -- for one-off precision-sensitive tests
+    living in an otherwise-unrelated TestCase."""
+    prev = Enilnets.is_float64_enabled()
+    Enilnets.use_float64(True)
+    try:
+        yield
+    finally:
+        Enilnets.use_float64(prev)
+
 
 def numerical_gradient(fn, x, eps=1e-5):
     """Compute numerical gradient of fn w.r.t. x via central differences."""
@@ -92,7 +138,7 @@ class TestWeightInit(unittest.TestCase):
             w, b = init_weights(100, 50, method=method)
             self.assertEqual(w.shape, (50, 100))
             self.assertEqual(b.shape, (50,))
-            self.assertEqual(w.dtype, np.float64)
+            self.assertEqual(w.dtype, Enilnets.default_dtype())
             self.assertTrue(np.all(np.isfinite(w)))
         w, _ = init_weights(10, 10, method="zeros")
         self.assertTrue(np.allclose(w, 0))
@@ -136,7 +182,7 @@ class TestWeightInit(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(col)))
 
 
-class TestActivations(unittest.TestCase):
+class TestActivations(_FDPrecisionMixin, unittest.TestCase):
     def test_relu_range(self):
         x = np.array([-2, -1, 0, 1, 2], dtype=np.float64)
         out = activate("relu", x)
@@ -348,7 +394,7 @@ class TestForwardPass(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(out)))
 
 
-class TestBackwardPass(unittest.TestCase):
+class TestBackwardPass(_FDPrecisionMixin, unittest.TestCase):
     def test_dense_gradient_flow(self):
         model = NeuralNet(learning_rate=0.1, optimizer="sgd")
         model.add_dense(5, 4, activation="linear")
@@ -459,7 +505,7 @@ class TestBackwardPass(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(model.deltas[0])))
 
 
-class TestBackwardLossGradients(unittest.TestCase):
+class TestBackwardLossGradients(_FDPrecisionMixin, unittest.TestCase):
     """Regression tests for Backward()'s per-loss-function gradient dispatch:
     every loss_function must produce a gradient matching a finite-difference
     approximation of loss.py's own ComputeLoss formula, not the old hardcoded
@@ -479,7 +525,7 @@ class TestBackwardLossGradients(unittest.TestCase):
         eps = 1e-6
         W = model.layers[1]["weights"]
         i, j = 0, 1
-        orig = W[i, j]
+        orig = float(W[i, j])
 
         def loss_val():
             out = model.Forward(x, training=True)
@@ -551,7 +597,7 @@ class TestBackwardLossGradients(unittest.TestCase):
         self.assertTrue(np.isfinite(loss1))
 
 
-class TestAttention(unittest.TestCase):
+class TestAttention(_FDPrecisionMixin, unittest.TestCase):
     """Regression tests for the multi-head self-attention implementation
     (previously non-functional: chained dense layers with no Q/K/V/softmax,
     and never even bound onto NeuralNet)."""
@@ -590,7 +636,7 @@ class TestAttention(unittest.TestCase):
         for name in ("Wq", "Wk", "Wv", "Wo"):
             W = layer[name]
             i, j = 1, 2
-            orig = W[i, j]
+            orig = float(W[i, j])
             W[i, j] = orig + eps
             out_p = model.Forward(x, training=True)
             loss_p = np.sum(out_p * dout)
@@ -602,7 +648,7 @@ class TestAttention(unittest.TestCase):
             self.assertAlmostEqual(numeric, layer["d_" + name][i, j], delta=max(1e-4, abs(numeric) * 1e-3))
 
         b, s, e = 0, 1, 3
-        orig = x[b, s, e]
+        orig = float(x[b, s, e])
         x[b, s, e] = orig + eps
         out_p = model.Forward(x, training=True)
         loss_p = np.sum(out_p * dout)
@@ -691,7 +737,7 @@ class TestAttention(unittest.TestCase):
         eps = 1e-6
         i, j = 1, 2
         W = layer["Wq"]
-        orig = W[i, j]
+        orig = float(W[i, j])
         W[i, j] = orig + eps
         loss_p = np.sum(model.Forward(x, training=True) * dout)
         W[i, j] = orig - eps
@@ -701,7 +747,7 @@ class TestAttention(unittest.TestCase):
         self.assertAlmostEqual(numeric, layer["d_Wq"][i, j], delta=max(1e-4, abs(numeric) * 1e-3))
 
 
-class TestPositionalSchemes(unittest.TestCase):
+class TestPositionalSchemes(_FDPrecisionMixin, unittest.TestCase):
     """v3.1.0 Phase 8: positional_scheme="absolute"|"rope"|"alibi" on
     add_multihead_attention."""
 
@@ -714,7 +760,7 @@ class TestPositionalSchemes(unittest.TestCase):
         idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
             flat[idx] = orig - eps
@@ -1555,7 +1601,7 @@ class TestDiffusion(unittest.TestCase):
                              learning_rate=0.02, use_ema=False)
         X = np.random.randn(30, 4) * 0.5
         losses = [diff.train_step(X) for _ in range(60)]
-        self.assertLess(np.mean(losses[-10:]), np.mean(losses[:10]))
+        self.assertLess(statistics.mean(losses[-10:]), statistics.mean(losses[:10]))
 
 
 class TestClassConditionalGeneration(unittest.TestCase):
@@ -1812,7 +1858,7 @@ class TestUNet(unittest.TestCase):
         self.assertGreater(len(params), 0)
 
 
-class TestUNetDenoiser(unittest.TestCase):
+class TestUNetDenoiser(_FDPrecisionMixin, unittest.TestCase):
     """v3.1.0 Phase 3: UNetDenoiser real backward + k=3 same-padding convs.
 
     Non-negotiable per the project's QA bar: finite-difference gradient
@@ -1834,7 +1880,7 @@ class TestUNetDenoiser(unittest.TestCase):
         idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             loss_p = loss_fn()
             flat[idx] = orig - eps
@@ -1923,7 +1969,7 @@ class TestUNetDenoiser(unittest.TestCase):
                             time_steps=50, learning_rate=0.01)
         X = np.random.randn(20, 1, 8, 8) * 0.5
         losses = [unet.train_step(X) for _ in range(40)]
-        self.assertLess(np.mean(losses[-10:]), np.mean(losses[:10]))
+        self.assertLess(statistics.mean(losses[-10:]), statistics.mean(losses[:10]))
 
     def test_train_runs_and_returns_history(self):
         np.random.seed(0)
@@ -2034,7 +2080,7 @@ class TestGenerativeLosses(unittest.TestCase):
         self.assertIsInstance(val_vgg, float)
 
 
-class TestGenerativeFixesRegression(unittest.TestCase):
+class TestGenerativeFixesRegression(_FDPrecisionMixin, unittest.TestCase):
     """Extra regression coverage for the generative-model gradient fixes not
     already exercised above (VAE BCE gradient, AR continuous-loss gradient)."""
 
@@ -2488,7 +2534,7 @@ class TestSpeedRefactorEquivalence(unittest.TestCase):
         for i in range(30):
             for j in range(i + 1, 30):
                 dists.append(np.linalg.norm(subset[i] - subset[j]))
-        ref = np.mean(dists)
+        ref = np.mean(np.array(dists))
         # replicate eval_utils' internal subset selection by monkeypatching choice
         import Enilnets.eval_utils as eu
         orig_choice = np.random.choice
@@ -2737,8 +2783,9 @@ class TestTextUtils(unittest.TestCase):
         self.assertEqual(out.shape, (2, 5))
 
     def test_create_sliding_windows(self):
-        windows = txt_utils.create_sliding_windows(np.arange(20), 5, 1)
-        self.assertTrue(np.all(np.isfinite(windows)))
+        X, y = txt_utils.create_sliding_windows(np.arange(20), 5, 1)
+        self.assertTrue(np.all(np.isfinite(X)))
+        self.assertTrue(np.all(np.isfinite(y)))
 
 
 class TestEvalUtils(unittest.TestCase):
@@ -2878,7 +2925,7 @@ class TestEdgeCases(unittest.TestCase):
         self.assertGreater(acc, 0.5)
 
 
-class TestResidualConnections(unittest.TestCase):
+class TestResidualConnections(_FDPrecisionMixin, unittest.TestCase):
     """add_residual_start()/add_residual_end() -- verified via finite
     difference against both the layer that starts the skip connection and a
     layer inside the wrapped block."""
@@ -2916,7 +2963,7 @@ class TestResidualConnections(unittest.TestCase):
 
         for layer_idx, i, j in ((0, 1, 2), (2, 0, 3), (3, 2, 1)):
             W = model.layers[layer_idx]["weights"]
-            orig = W[i, j]
+            orig = float(W[i, j])
             W[i, j] = orig + eps
             lp = mse()
             W[i, j] = orig - eps
@@ -2975,7 +3022,7 @@ class TestResidualConnections(unittest.TestCase):
         idxs = rng.choice(flat.size, size=6, replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             lp = loss_fn()
             flat[idx] = orig - eps
@@ -2986,7 +3033,7 @@ class TestResidualConnections(unittest.TestCase):
         self.assertLess(max_err, 1e-6)
 
 
-class TestMultiSourceLayers(unittest.TestCase):
+class TestMultiSourceLayers(_FDPrecisionMixin, unittest.TestCase):
     """v3.1.0 Phase 5: shared "goto"/"concat_at"/"reverse_sequence" layer
     infrastructure (used internally by cross-attention and bidirectional
     RNN). The indexing convention here is deliberately direct -- a
@@ -3064,7 +3111,7 @@ class TestMultiSourceLayers(unittest.TestCase):
         idxs = rng.choice(flat.size, size=6, replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             lp = loss_fn()
             flat[idx] = orig - eps
@@ -3103,7 +3150,7 @@ class TestMultiSourceLayers(unittest.TestCase):
             idxs = rng.choice(flat.size, size=min(6, flat.size), replace=False)
             max_err = 0.0
             for idx in idxs:
-                orig = flat[idx]
+                orig = float(flat[idx])
                 flat[idx] = orig + eps
                 lp = loss_fn()
                 flat[idx] = orig - eps
@@ -3148,7 +3195,7 @@ class TestMultiSourceLayers(unittest.TestCase):
         idxs = rng.choice(flat.size, size=6, replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             lp = loss_fn()
             flat[idx] = orig - eps
@@ -3159,7 +3206,7 @@ class TestMultiSourceLayers(unittest.TestCase):
         self.assertLess(max_err, 1e-6)
 
 
-class TestCrossAttention(unittest.TestCase):
+class TestCrossAttention(_FDPrecisionMixin, unittest.TestCase):
     """v3.1.0 Phase 6: add_cross_attention -- encoder-decoder style
     attention where Q comes from the normal sequential x and K/V come from
     an earlier layer's output (kv_source_index), built on Phase 5's direct
@@ -3192,7 +3239,7 @@ class TestCrossAttention(unittest.TestCase):
         idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             lp = loss_fn()
             flat[idx] = orig - eps
@@ -3257,7 +3304,7 @@ class TestCrossAttention(unittest.TestCase):
         self.assertLess(self._fd_check(model, X, Y, 1, "weights"), 1e-6)
 
 
-class TestRecurrentLayers(unittest.TestCase):
+class TestRecurrentLayers(_FDPrecisionMixin, unittest.TestCase):
     """add_rnn/add_lstm/add_gru -- full BPTT verified via finite difference
     over multiple timesteps, for every parameter and both
     return_sequences=True/False."""
@@ -3288,14 +3335,14 @@ class TestRecurrentLayers(unittest.TestCase):
             i = idx[0]
             j = idx[1] if len(idx) > 1 else None
             if j is None:
-                orig = W[i]
+                orig = float(W[i])
                 W[i] = orig + eps
                 lp = mse()
                 W[i] = orig - eps
                 lm = mse()
                 W[i] = orig
             else:
-                orig = W[i, j]
+                orig = float(W[i, j])
                 W[i, j] = orig + eps
                 lp = mse()
                 W[i, j] = orig - eps
@@ -3348,7 +3395,7 @@ class TestRecurrentLayers(unittest.TestCase):
 
             W = model.layers[0]["weights"]
             i, j = 2, 3
-            orig = W[i, j]
+            orig = float(W[i, j])
             W[i, j] = orig + eps
             lp = mse()
             W[i, j] = orig - eps
@@ -3370,7 +3417,7 @@ class TestRecurrentLayers(unittest.TestCase):
         self.assertEqual(model.layers[1]["n_in"], 6)
 
 
-class TestBidirectionalRNN(unittest.TestCase):
+class TestBidirectionalRNN(_FDPrecisionMixin, unittest.TestCase):
     """v3.1.0 Phase 7: add_bidirectional_rnn/_lstm/_gru -- a thin
     composition of Phase 5's goto/reverse_sequence/concat_at primitives
     around the existing add_rnn/add_lstm/add_gru."""
@@ -3386,7 +3433,7 @@ class TestBidirectionalRNN(unittest.TestCase):
         idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             lp = loss_fn()
             flat[idx] = orig - eps
@@ -3540,17 +3587,21 @@ class TestOptimizerFeatures(unittest.TestCase):
         self.assertTrue(np.allclose(net_acc.layers[0]["weights"], net_full.layers[0]["weights"]))
 
     def test_mixed_precision_close_to_float64(self):
-        np.random.seed(5)
-        model64 = NeuralNet(learning_rate=0.01, optimizer="adam")
-        model64.add_dense(10, 8, activation="relu")
-        model64.add_dense(8, 3, activation="linear")
-        model32 = model64.copy()
-        model32.use_mixed_precision = True
+        # use_mixed_precision now forces the matmul to float32 regardless of
+        # the ambient default dtype (see forward.py) -- so this comparison
+        # is only meaningful if model64 itself is genuinely float64.
+        with _force_float64():
+            np.random.seed(5)
+            model64 = NeuralNet(learning_rate=0.01, optimizer="adam")
+            model64.add_dense(10, 8, activation="relu")
+            model64.add_dense(8, 3, activation="linear")
+            model32 = model64.copy()
+            model32.use_mixed_precision = True
 
-        x = np.random.randn(4, 10)
-        o64 = model64.Forward(x, training=False)
-        o32 = model32.Forward(x, training=False)
-        self.assertTrue(np.allclose(o64, o32, atol=1e-3))
+            x = np.random.randn(4, 10)
+            o64 = model64.Forward(x, training=False)
+            o32 = model32.Forward(x, training=False)
+            self.assertTrue(np.allclose(o64, o32, atol=1e-3))
 
     def test_adamw_decays_weights_with_zero_gradient(self):
         model = NeuralNet(learning_rate=0.1, optimizer="adamw", l2_lambda=0.1)
@@ -3959,8 +4010,14 @@ class TestV31Phase1Fixes(unittest.TestCase):
         idx = np.random.randint(0, V, size=(B, S))
         onehot = np.eye(V)[idx]
         val = model.ComputeLoss(probs, onehot, function="cross_entropy")
-        expected = -np.sum(onehot * np.log(np.clip(probs, 1e-12, 1.0))) / (B * S)
-        self.assertAlmostEqual(val, expected, places=10)
+        expected = float(-np.sum(onehot * np.log(np.clip(probs, 1e-12, 1.0))) / (B * S))
+        # ComputeLoss casts inputs to the model's working dtype (float32 by
+        # default) before computing, while `expected` here is computed
+        # directly on the original (numpy-default float64) probs/onehot --
+        # places=10 assumed both sides were float64; loosened to a tolerance
+        # float32 can actually meet, since this test checks the reduction's
+        # *scaling* is correct, not bit-exact precision.
+        self.assertAlmostEqual(val, expected, places=5)
 
     def test_sparse_cross_entropy_backward_matches_onehot_backward(self):
         np.random.seed(0)
@@ -4129,7 +4186,7 @@ class TestV31Phase1Fixes(unittest.TestCase):
         self.assertGreater(rec.batches, 0)
 
 
-class TestV31Phase2ConvPadding(unittest.TestCase):
+class TestV31Phase2ConvPadding(_FDPrecisionMixin, unittest.TestCase):
     """v3.1.0 Phase 2: padding="same" for add_conv2d."""
 
     def _fd_check_param(self, model, X, Y, layer_idx, param_name, eps=1e-5, n_check=6):
@@ -4141,7 +4198,7 @@ class TestV31Phase2ConvPadding(unittest.TestCase):
         idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
             flat[idx] = orig - eps
@@ -4202,7 +4259,7 @@ class TestV31Phase2ConvPadding(unittest.TestCase):
         idxs = rng.choice(flat.size, size=8, replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
             flat[idx] = orig - eps
@@ -4277,7 +4334,7 @@ class TestV31Phase2ConvPadding(unittest.TestCase):
         self.assertGreaterEqual(loss, 0.0)
 
 
-class TestV31Phase4Conv1D(unittest.TestCase):
+class TestV31Phase4Conv1D(_FDPrecisionMixin, unittest.TestCase):
     """v3.1.0 Phase 4: add_conv1d for (batch, channels, length) data."""
 
     def _fd_check_param(self, model, X, Y, layer_idx, param_name, eps=1e-5, n_check=6):
@@ -4289,7 +4346,7 @@ class TestV31Phase4Conv1D(unittest.TestCase):
         idxs = rng.choice(flat.size, size=min(n_check, flat.size), replace=False)
         max_err = 0.0
         for idx in idxs:
-            orig = flat[idx]
+            orig = float(flat[idx])
             flat[idx] = orig + eps
             loss_p = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
             flat[idx] = orig - eps
@@ -4341,7 +4398,7 @@ class TestV31Phase4Conv1D(unittest.TestCase):
             idxs = rng.choice(flat.size, size=6, replace=False)
             max_err = 0.0
             for idx in idxs:
-                orig = flat[idx]
+                orig = float(flat[idx])
                 flat[idx] = orig + eps
                 lp = model.ComputeLoss(model.Forward(X, training=False), Y, function="mse")
                 flat[idx] = orig - eps
@@ -4416,8 +4473,8 @@ class BenchmarkMixin:
             fn(*args, **kwargs)
             t1 = time.perf_counter()
             times.append(t1 - t0)
-        avg = np.mean(times) * 1000
-        std = np.std(times) * 1000
+        avg = statistics.mean(times) * 1000
+        std = statistics.pstdev(times) * 1000
         print(f"  {name:45s} {avg:8.3f} ms +/- {std:6.3f} ms  (n={n_repeats})")
         return avg
 
