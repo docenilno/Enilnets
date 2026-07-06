@@ -1,9 +1,11 @@
-import numpy as np
+import math
+from .backend import np
+from . import backend
 from . import constants
 
 def ComputeLoss(self, output, target, function="mse", reduction="mean", **kwargs):
-    o = np.asarray(output, dtype=np.float64)
-    t = np.asarray(target, dtype=np.float64)
+    o = np.asarray(output, dtype=backend.default_dtype())
+    t = np.asarray(target, dtype=backend.default_dtype())
     eps = kwargs.get("eps", constants.EPS_LOG)
     eps_div = kwargs.get("eps_div", constants.EPS_DIV)
     if function == "mse":
@@ -27,7 +29,7 @@ def ComputeLoss(self, output, target, function="mse", reduction="mean", **kwargs
         # Divide by every leading (non-class) dim -- batch_size*seq_len for
         # (B,S,V) sequence output, not just batch_size (o.shape[0]), else the
         # reported loss/gradient scale is off by a factor of seq_len.
-        n = int(np.prod(o.shape[:-1])) if o.ndim > 1 else o.shape[0]
+        n = math.prod(o.shape[:-1]) if o.ndim > 1 else o.shape[0]
         if reduction == "mean":
             return float(np.sum(loss) / n)
         if reduction == "sum":
@@ -46,7 +48,7 @@ def ComputeLoss(self, output, target, function="mse", reduction="mean", **kwargs
             )
         picked = np.take_along_axis(o, idx[..., None], axis=-1)[..., 0]
         loss = -np.log(picked)
-        n = int(np.prod(o.shape[:-1])) if o.ndim > 1 else o.shape[0]
+        n = math.prod(o.shape[:-1]) if o.ndim > 1 else o.shape[0]
         if reduction == "mean":
             return float(np.sum(loss) / n)
         if reduction == "sum":
@@ -95,7 +97,7 @@ def ComputeLoss(self, output, target, function="mse", reduction="mean", **kwargs
         sim = np.dot(o_norm, t_norm.T) / temperature
         sim_max = np.max(sim, axis=-1, keepdims=True)
         exp_sim = np.exp(sim - sim_max)
-        pos_mask = np.eye(o.shape[0], dtype=np.float64)
+        pos_mask = np.eye(o.shape[0], dtype=backend.default_dtype())
         pos = np.sum(exp_sim * pos_mask, axis=-1)
         neg = np.sum(exp_sim, axis=-1)
         loss = -np.log(pos / (neg + eps_div) + eps_div)

@@ -1,4 +1,5 @@
-import numpy as np
+from .backend import np
+from . import backend
 from .activations import activate
 from . import constants
 
@@ -34,7 +35,7 @@ def _rope_cos_sin(S, head_dim, base):
     (..., S, head_dim/2) array (numpy aligns trailing dims)."""
     half = head_dim // 2
     theta = base ** (-2.0 * np.arange(half) / head_dim)
-    pos = np.arange(S, dtype=np.float64)
+    pos = np.arange(S, dtype=backend.default_dtype())
     angles = pos[:, None] * theta[None, :]
     return np.cos(angles), np.sin(angles)
 
@@ -119,7 +120,7 @@ def layernorm_forward(x, layer, training):
     return out, cache
 
 def Forward(self, inputs, training=False, dropout_rate=0.0):
-    x = np.asarray(inputs, dtype=np.float64)
+    x = np.asarray(inputs, dtype=backend.default_dtype())
     first_type = self.layers[0]["type"] if self.layers else None
     if x.ndim == 1:
         x = x.reshape(1, -1)
@@ -142,14 +143,17 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
         attn_cache_entry = None
         conv_cache_entry = None
         rnn_cache_entry = None
-        compute_dtype = np.float32 if getattr(self, "use_mixed_precision", False) else np.float64
+        # Master weights/activations stay at the model's working dtype
+        # (backend.default_dtype() -- float32 by default, float64 if
+        # use_float64(True) was called); when use_mixed_precision is on,
+        # only the matmul itself is forced down to float32 for a real
+        # BLAS speedup on the hot path -- a no-op if the working dtype is
+        # already float32.
+        compute_dtype = np.float32 if getattr(self, "use_mixed_precision", False) else backend.default_dtype()
         if layer["type"] in ("dense", "sparse"):
-            # Master weights stay float64 (updated by the optimizer at full
-            # precision); only the matmul itself runs in float32 when mixed
-            # precision is on, for a real BLAS speedup on the hot path.
             z = np.dot(x.astype(compute_dtype), layer["weights"].astype(compute_dtype).T) + \
                 layer["bias"].astype(compute_dtype)
-            z = z.astype(np.float64)
+            z = z.astype(backend.default_dtype())
             x = activate(layer["activation"], z, **layer.get("activation_params", {}))
             self.pre_activations.append(z)
             self.batchnorm_cache.append(None)
@@ -164,7 +168,7 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
             conv_cache_entry = col
             weights_flat = layer["weights"].reshape(F, -1)
             out = np.dot(col.astype(compute_dtype), weights_flat.astype(compute_dtype).T) \
-                .astype(np.float64).reshape(B, out_h, out_w, F).transpose(0, 3, 1, 2)
+                .astype(backend.default_dtype()).reshape(B, out_h, out_w, F).transpose(0, 3, 1, 2)
             z = out + layer["bias"][None, :, None, None]
             x = activate(layer["activation"], z, **layer.get("activation_params", {}))
             self.pre_activations.append(z)
@@ -180,7 +184,7 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
             conv_cache_entry = col
             weights_flat = layer["weights"].reshape(F, -1)
             out = np.dot(col.astype(compute_dtype), weights_flat.astype(compute_dtype).T) \
-                .astype(np.float64).reshape(B, out_l, F).transpose(0, 2, 1)
+                .astype(backend.default_dtype()).reshape(B, out_l, F).transpose(0, 2, 1)
             z = out + layer["bias"][None, :, None]
             x = activate(layer["activation"], z, **layer.get("activation_params", {}))
             self.pre_activations.append(z)
@@ -231,10 +235,10 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
             rate = layer.get("rate", dropout_rate)
             if training and rate > 0:
                 if rate >= 1.0:
-                    mask = np.zeros_like(x, dtype=np.float64)
+                    mask = np.zeros_like(x, dtype=backend.default_dtype())
                     x = np.zeros_like(x)
                 else:
-                    mask = (np.random.rand(*x.shape) > rate).astype(np.float64)
+                    mask = (np.random.rand(*x.shape) > rate).astype(backend.default_dtype())
                     x = x * mask / (1.0 - rate)
                 layer["mask"] = mask
             else:
@@ -345,8 +349,8 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
         elif layer["type"] == "rnn":
             B, S, _ = x.shape
             H = layer["hidden_dim"]
-            h = np.zeros((B, H), dtype=np.float64)
-            h_all = np.zeros((B, S + 1, H), dtype=np.float64)
+            h = np.zeros((B, H), dtype=backend.default_dtype())
+            h_all = np.zeros((B, S + 1, H), dtype=backend.default_dtype())
             for t in range(S):
                 z = np.dot(x[:, t, :], layer["Wx"].T) + np.dot(h, layer["Wh"].T) + layer["b"]
                 h = np.tanh(z)
@@ -359,15 +363,15 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
         elif layer["type"] == "lstm":
             B, S, _ = x.shape
             H = layer["hidden_dim"]
-            h = np.zeros((B, H), dtype=np.float64)
-            c = np.zeros((B, H), dtype=np.float64)
-            h_all = np.zeros((B, S + 1, H), dtype=np.float64)
-            c_all = np.zeros((B, S + 1, H), dtype=np.float64)
-            i_all = np.zeros((B, S, H), dtype=np.float64)
-            f_all = np.zeros((B, S, H), dtype=np.float64)
-            g_all = np.zeros((B, S, H), dtype=np.float64)
-            o_all = np.zeros((B, S, H), dtype=np.float64)
-            tanh_c_all = np.zeros((B, S, H), dtype=np.float64)
+            h = np.zeros((B, H), dtype=backend.default_dtype())
+            c = np.zeros((B, H), dtype=backend.default_dtype())
+            h_all = np.zeros((B, S + 1, H), dtype=backend.default_dtype())
+            c_all = np.zeros((B, S + 1, H), dtype=backend.default_dtype())
+            i_all = np.zeros((B, S, H), dtype=backend.default_dtype())
+            f_all = np.zeros((B, S, H), dtype=backend.default_dtype())
+            g_all = np.zeros((B, S, H), dtype=backend.default_dtype())
+            o_all = np.zeros((B, S, H), dtype=backend.default_dtype())
+            tanh_c_all = np.zeros((B, S, H), dtype=backend.default_dtype())
             for t in range(S):
                 gates = np.dot(x[:, t, :], layer["Wx"].T) + np.dot(h, layer["Wh"].T) + layer["b"]
                 i_t = 1.0 / (1.0 + np.exp(-gates[:, 0 * H:1 * H]))
@@ -390,12 +394,12 @@ def Forward(self, inputs, training=False, dropout_rate=0.0):
         elif layer["type"] == "gru":
             B, S, _ = x.shape
             H = layer["hidden_dim"]
-            h = np.zeros((B, H), dtype=np.float64)
-            h_all = np.zeros((B, S + 1, H), dtype=np.float64)
-            r_all = np.zeros((B, S, H), dtype=np.float64)
-            z_all = np.zeros((B, S, H), dtype=np.float64)
-            n_all = np.zeros((B, S, H), dtype=np.float64)
-            gh_n_all = np.zeros((B, S, H), dtype=np.float64)
+            h = np.zeros((B, H), dtype=backend.default_dtype())
+            h_all = np.zeros((B, S + 1, H), dtype=backend.default_dtype())
+            r_all = np.zeros((B, S, H), dtype=backend.default_dtype())
+            z_all = np.zeros((B, S, H), dtype=backend.default_dtype())
+            n_all = np.zeros((B, S, H), dtype=backend.default_dtype())
+            gh_n_all = np.zeros((B, S, H), dtype=backend.default_dtype())
             for t in range(S):
                 gi = np.dot(x[:, t, :], layer["Wx"].T) + layer["bx"]
                 gh = np.dot(h, layer["Wh"].T) + layer["bh"]

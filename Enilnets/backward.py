@@ -1,4 +1,6 @@
-import numpy as np
+import math
+from .backend import np
+from . import backend
 from .activations import derivative
 from .forward import im2col, im2col1d, _rope_cos_sin, _rope_rotate
 from . import constants
@@ -18,7 +20,7 @@ def maxpool2d_backward(delta, x, p):
     x_blocks = np.lib.stride_tricks.as_strided(x_trim, shape=new_shape, strides=new_strides)
 
     x_max = x_blocks.max(axis=(3, 5), keepdims=True)
-    mask = (x_blocks == x_max).astype(np.float64)
+    mask = (x_blocks == x_max).astype(backend.default_dtype())
     mask_sum = mask.sum(axis=(3, 5), keepdims=True)
     mask = mask / np.maximum(mask_sum, 1e-12)
 
@@ -273,8 +275,8 @@ def rnn_backward(dout, layer, cache):
     dWx = np.zeros_like(Wx)
     dWh = np.zeros_like(Wh)
     db = np.zeros_like(layer["b"])
-    dx = np.zeros((B, S, n_in), dtype=np.float64)
-    dh_next = np.zeros((B, H), dtype=np.float64)
+    dx = np.zeros((B, S, n_in), dtype=backend.default_dtype())
+    dh_next = np.zeros((B, H), dtype=backend.default_dtype())
 
     for t in reversed(range(S)):
         dh = (dout[:, t, :] if return_sequences else (dout if t == S - 1 else 0.0)) + dh_next
@@ -305,9 +307,9 @@ def lstm_backward(dout, layer, cache):
     dWx = np.zeros_like(Wx)
     dWh = np.zeros_like(Wh)
     db = np.zeros_like(layer["b"])
-    dx = np.zeros((B, S, n_in), dtype=np.float64)
-    dh_next = np.zeros((B, H), dtype=np.float64)
-    dc_next = np.zeros((B, H), dtype=np.float64)
+    dx = np.zeros((B, S, n_in), dtype=backend.default_dtype())
+    dh_next = np.zeros((B, H), dtype=backend.default_dtype())
+    dc_next = np.zeros((B, H), dtype=backend.default_dtype())
 
     for t in reversed(range(S)):
         dh = (dout[:, t, :] if return_sequences else (dout if t == S - 1 else 0.0)) + dh_next
@@ -356,8 +358,8 @@ def gru_backward(dout, layer, cache):
     dWh = np.zeros_like(Wh)
     dbx = np.zeros_like(layer["bx"])
     dbh = np.zeros_like(layer["bh"])
-    dx = np.zeros((B, S, n_in), dtype=np.float64)
-    dh_next = np.zeros((B, H), dtype=np.float64)
+    dx = np.zeros((B, S, n_in), dtype=backend.default_dtype())
+    dh_next = np.zeros((B, H), dtype=backend.default_dtype())
 
     for t in reversed(range(S)):
         dh = (dout[:, t, :] if return_sequences else (dout if t == S - 1 else 0.0)) + dh_next
@@ -568,7 +570,7 @@ def _loss_output_delta(o, t, z, activation, loss_function, batch_size, loss_kwar
 
 def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_kwargs):
     if output_delta is not None:
-        output_delta = np.asarray(output_delta, dtype=np.float64)
+        output_delta = np.asarray(output_delta, dtype=backend.default_dtype())
         if output_delta.ndim == 1:
             output_delta = output_delta.reshape(1, -1)
         self.deltas = [None] * len(self.layers)
@@ -576,16 +578,16 @@ def Backward(self, targets=None, output_delta=None, loss_function=None, **loss_k
     else:
         if targets is None:
             raise ValueError("targets must be provided if output_delta is not given")
-        targets = np.asarray(targets, dtype=np.float64)
+        targets = np.asarray(targets, dtype=backend.default_dtype())
         if loss_function == "sparse_cross_entropy":
             # targets are integer class indices shaped like out.shape[:-1]
             # (e.g. (B,) or (B,S)) -- not a one-hot array, so the generic
             # "1D -> (1, features)" reshape below doesn't apply here.
-            batch_size = int(np.prod(targets.shape))
+            batch_size = math.prod(targets.shape)
         else:
             if targets.ndim == 1:
                 targets = targets.reshape(1, -1)
-            batch_size = int(np.prod(targets.shape[:-1]))
+            batch_size = math.prod(targets.shape[:-1])
         self.deltas = [None] * len(self.layers)
         out = self.outputs[-1]
         last = self.layers[-1]

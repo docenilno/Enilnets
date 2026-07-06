@@ -3,7 +3,8 @@
 Transformer (self-attention) layers for Enilnets.
 Enables modern NLP, vision transformer (ViT), and cross-modal models.
 """
-import numpy as np
+from .backend import np
+from . import backend
 from . import constants
 
 def add_transformer_block(self, embed_dim=None, num_heads=4, mlp_ratio=4.0, dropout=0.0, activation="swish",
@@ -88,7 +89,7 @@ def add_positional_encoding(self, max_seq_len, embed_dim=None, learnable=True, b
     else:
         # Fixed sinusoidal encoding stored as a constant
         freq_base = constants.SINUSOIDAL_BASE if base is None else base
-        pe = np.zeros((max_seq_len, embed_dim), dtype=np.float64)
+        pe = np.zeros((max_seq_len, embed_dim), dtype=backend.default_dtype())
         position = np.arange(max_seq_len).reshape(-1, 1)
         div_term = np.exp(np.arange(0, embed_dim, 2) * -(np.log(freq_base) / embed_dim))
         pe[:, 0::2] = np.sin(position * div_term)

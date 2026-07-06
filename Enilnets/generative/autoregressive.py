@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 
 class AutoregressiveModel:
@@ -26,7 +27,7 @@ class AutoregressiveModel:
 
         # Precomputed once (it never changes): rebuilding + tiling this per
         # batch on every forward() call was pure overhead.
-        self._mask = np.tril(np.ones((self.data_dim, self.data_dim), dtype=np.float64), k=-1)
+        self._mask = np.tril(np.ones((self.data_dim, self.data_dim), dtype=backend.default_dtype()), k=-1)
 
     def _create_masks(self, batch_size):
         """Kept for backward compatibility; prefer the cached self._mask
@@ -34,7 +35,7 @@ class AutoregressiveModel:
         return np.tile(self._mask[None, :, :], (batch_size, 1, 1))
 
     def forward(self, x, training=True):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
         elif x.ndim == 1:
@@ -50,7 +51,7 @@ class AutoregressiveModel:
         return logits
 
     def loss(self, x):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
 
@@ -73,7 +74,7 @@ class AutoregressiveModel:
             return float(np.mean((logits - x) ** 2))
 
     def train_step(self, x):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
         batch_size = x.shape[0]
@@ -122,7 +123,7 @@ class AutoregressiveModel:
         return self.loss(x)
 
     def Train(self, X_train, epochs=10, batch_size=64, verbose=True):
-        X = np.asarray(X_train, dtype=np.float64)
+        X = np.asarray(X_train, dtype=backend.default_dtype())
         if X.ndim > 2:
             X = X.reshape(X.shape[0], -1)
         n_samples = X.shape[0]
@@ -154,7 +155,7 @@ class AutoregressiveModel:
         if shape is None:
             shape = (self.data_dim,)
 
-        samples = np.zeros((n_samples, self.data_dim), dtype=np.float64)
+        samples = np.zeros((n_samples, self.data_dim), dtype=backend.default_dtype())
 
         for i in range(self.data_dim):
             logits = self.forward(samples, training=False)
@@ -166,7 +167,7 @@ class AutoregressiveModel:
                 exp_logits = np.exp(logit_i - logit_max)
                 probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
                 # Sample
-                samples[:, i] = np.array([np.random.choice(self.num_classes, p=p) for p in probs]) / (self.num_classes - 1)
+                samples[:, i] = np.array([np.random.choice(self.num_classes, size=1, p=p)[0] for p in probs]) / (self.num_classes - 1)
             else:
                 # For continuous: sample from Gaussian with mean = logits and std = temperature
                 samples[:, i] = logits[:, i] + np.random.randn(n_samples) * temperature
@@ -188,7 +189,7 @@ class AutoregressiveModel:
         temperature : float
             Sampling temperature.
         """
-        partial_x = np.asarray(partial_x, dtype=np.float64).copy()
+        partial_x = np.asarray(partial_x, dtype=backend.default_dtype()).copy()
         if partial_x.ndim == 1:
             partial_x = partial_x.reshape(1, -1)
 
@@ -203,7 +204,7 @@ class AutoregressiveModel:
                 logit_max = np.max(logit_i, axis=-1, keepdims=True)
                 exp_logits = np.exp(logit_i - logit_max)
                 probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
-                partial_x[:, i] = np.array([np.random.choice(self.num_classes, p=p) for p in probs]) / (self.num_classes - 1)
+                partial_x[:, i] = np.array([np.random.choice(self.num_classes, size=1, p=p)[0] for p in probs]) / (self.num_classes - 1)
             else:
                 partial_x[:, i] = logits[:, i] + np.random.randn(partial_x.shape[0]) * temperature
 
@@ -213,7 +214,7 @@ class AutoregressiveModel:
 
     def log_prob(self, x):
         """Log probability of data under the model."""
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
 

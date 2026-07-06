@@ -17,7 +17,8 @@ Pass sample_input to either to color nodes by their actual activation value
 from a live forward pass -- call this from inside your own training loop
 whenever you want a snapshot of what the network is doing right now.
 """
-import numpy as np
+from .backend import np
+from . import backend
 
 _NODE_RADIUS = 12
 _COL_SPACING = 170
@@ -197,7 +198,7 @@ def plot_network(model, sample_input=None, max_nodes_per_layer=20, filename=None
             out_arr = model.outputs[0] if li is None else model.outputs[li + 1]
             if out_arr.ndim == 2:
                 key = -1 if li is None else li
-                activations[key] = np.asarray(out_arr[0], dtype=np.float64)
+                activations[key] = np.asarray(out_arr[0], dtype=backend.default_dtype())
 
     node_cols = [c for c in columns if c["kind"] == "nodes"]
     max_display = max((min(c["size"], max_nodes_per_layer) for c in node_cols), default=1)
@@ -312,7 +313,7 @@ def plot_genome(genome, sample_input=None, max_nodes_per_layer=30, show_disabled
         # Re-implement Genome.forward's evaluation loop here (rather than
         # calling it) so every intermediate node's value is captured, not
         # just the final outputs.
-        x = np.asarray(sample_input, dtype=np.float64).reshape(1, -1)
+        x = np.asarray(sample_input, dtype=backend.default_dtype()).reshape(1, -1)
         from .activations import activate
         incoming = {}
         for conn in genome.connections.values():

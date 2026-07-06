@@ -1,4 +1,5 @@
-import numpy as np
+from .backend import np
+from . import backend
 from . import constants
 
 def activate(name, x, alpha=None, sigmoid_clip=None):
@@ -43,7 +44,7 @@ def derivative(name, x, alpha=None, sigmoid_clip=None, cached_output=None):
         safe to omit) for activations whose derivative doesn't need it.
     """
     clip = constants.SIGMOID_CLIP if sigmoid_clip is None else sigmoid_clip
-    if name == "relu": return (x > 0).astype(np.float64)
+    if name == "relu": return (x > 0).astype(backend.default_dtype())
     if name == "leakyrelu":
         a = constants.LEAKYRELU_ALPHA if alpha is None else alpha
         return np.where(x > 0, 1.0, a)

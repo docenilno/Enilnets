@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 
 class GAN:
@@ -58,7 +59,7 @@ class GAN:
             y = np.repeat(y, n)
         if y.shape[0] != n:
             raise ValueError(f"y has {y.shape[0]} labels but batch size is {n}")
-        return np.eye(self.num_classes, dtype=np.float64)[y]
+        return np.eye(self.num_classes, dtype=backend.default_dtype())[y]
 
     def generate(self, n_samples, y=None):
         z = np.random.randn(n_samples, self.latent_dim)
@@ -68,7 +69,7 @@ class GAN:
         return self.generator.Forward(z, training=True)
 
     def discriminate(self, x, y=None):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
         onehot = self._onehot(y, x.shape[0])
@@ -93,8 +94,8 @@ class GAN:
         if self.loss_type == "bce":
             # Label smoothing (real labels = label_smoothing, not 1.0) keeps D
             # from getting overconfident, preserving a useful gradient for G.
-            real_targets = np.full((batch_size, 1), self.label_smoothing, dtype=np.float64)
-            fake_targets = np.zeros((fake_bs, 1), dtype=np.float64)
+            real_targets = np.full((batch_size, 1), self.label_smoothing, dtype=backend.default_dtype())
+            fake_targets = np.zeros((fake_bs, 1), dtype=backend.default_dtype())
             combined_targets = np.concatenate([real_targets, fake_targets], axis=0)
             # Canonical sigmoid+BCE gradient w.r.t. the pre-activation logit:
             # (out - target)/N, without the extra sigmoid-derivative factor.
@@ -106,8 +107,8 @@ class GAN:
             return float(real_loss + fake_loss)
 
         elif self.loss_type == "bce_logits":
-            real_targets = np.full((batch_size, 1), self.label_smoothing, dtype=np.float64)
-            fake_targets = np.zeros((fake_bs, 1), dtype=np.float64)
+            real_targets = np.full((batch_size, 1), self.label_smoothing, dtype=backend.default_dtype())
+            fake_targets = np.zeros((fake_bs, 1), dtype=backend.default_dtype())
             combined_targets = np.concatenate([real_targets, fake_targets], axis=0)
             # d_combined holds the raw logit; correct BCEWithLogits gradient is
             # sigmoid(logit) - target.
@@ -171,7 +172,7 @@ class GAN:
 
         elif self.loss_type == "wasserstein":
             # G wants D(fake) to be high: loss = -mean(D(fake)) => dL/dD(fake) = -1/N (constant).
-            delta = -np.ones((batch_size, 1), dtype=np.float64) / batch_size
+            delta = -np.ones((batch_size, 1), dtype=backend.default_dtype()) / batch_size
             self.discriminator.Backward(None, output_delta=delta)
             first_layer = self.discriminator.layers[0]
             d_input = np.dot(self.discriminator.deltas[0], first_layer["weights"])[:, :self.data_dim]
@@ -182,7 +183,7 @@ class GAN:
         return 0.0
 
     def Train(self, X_train, epochs=10, batch_size=64, d_steps=1, g_steps=1, verbose=True, y_train=None):
-        X = np.asarray(X_train, dtype=np.float64)
+        X = np.asarray(X_train, dtype=backend.default_dtype())
         if X.ndim > 2:
             X = X.reshape(X.shape[0], -1)
         n_samples = X.shape[0]

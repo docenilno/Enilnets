@@ -1,4 +1,4 @@
-import numpy as np
+from .backend import np
 import copy
 from . import constants
 

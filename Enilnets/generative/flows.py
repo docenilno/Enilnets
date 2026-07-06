@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 
 class RealNVP:
@@ -37,7 +38,7 @@ class RealNVP:
             return np.concatenate([x2, x1], axis=1)
 
     def forward(self, x):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim == 1:
             x = x.reshape(1, -1)
 
@@ -56,7 +57,7 @@ class RealNVP:
         return z, log_det
 
     def inverse(self, z):
-        z = np.asarray(z, dtype=np.float64)
+        z = np.asarray(z, dtype=backend.default_dtype())
         if z.ndim == 1:
             z = z.reshape(1, -1)
 
@@ -129,7 +130,7 @@ class RealNVP:
     def train_step(self, x):
         """One gradient step minimizing negative log-likelihood, backpropagating
         through all coupling layers."""
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim == 1:
             x = x.reshape(1, -1)
         batch_size = x.shape[0]
@@ -198,7 +199,7 @@ class RealNVP:
 
     def Train(self, X_train, epochs=10, batch_size=64, verbose=True):
         """Gradient-based training loop over epochs of minibatches."""
-        X = np.asarray(X_train, dtype=np.float64)
+        X = np.asarray(X_train, dtype=backend.default_dtype())
         if X.ndim == 1:
             X = X.reshape(1, -1)
         n_samples = X.shape[0]

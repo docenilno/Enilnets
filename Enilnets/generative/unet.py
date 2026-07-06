@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 
 def time_embedding(t, dim, max_period=10000):
@@ -8,7 +9,7 @@ def time_embedding(t, dim, max_period=10000):
     dim: embedding dimension (must be even)
     Returns: (batch, dim) embedding
     """
-    t = np.asarray(t, dtype=np.float64).reshape(-1)
+    t = np.asarray(t, dtype=backend.default_dtype()).reshape(-1)
     half = dim // 2
     freqs = np.exp(-np.log(max_period) * np.arange(half) / half)
     args = t[:, None] * freqs[None, :]
@@ -34,10 +35,10 @@ class UNetDenoiser:
         # on its own via train_step/Train/sample, without needing a separate
         # DiffusionModel wrapper.
         self.time_steps = time_steps
-        self.betas = np.linspace(beta_start, beta_end, time_steps, dtype=np.float64)
+        self.betas = np.linspace(beta_start, beta_end, time_steps, dtype=backend.default_dtype())
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = np.cumprod(self.alphas)
-        self.alphas_cumprod_prev = np.concatenate([[1.0], self.alphas_cumprod[:-1]])
+        self.alphas_cumprod_prev = np.concatenate([np.array([1.0]), self.alphas_cumprod[:-1]])
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
         self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
@@ -96,7 +97,7 @@ class UNetDenoiser:
         if H == target_H and W == target_W:
             return x
         if H == 0 or W == 0:
-            return np.zeros((B, C, target_H, target_W), dtype=np.float64)
+            return np.zeros((B, C, target_H, target_W), dtype=backend.default_dtype())
         scale_h = max(1, target_H // H)
         scale_w = max(1, target_W // W)
         x = x.repeat(scale_h, axis=2).repeat(scale_w, axis=3)
@@ -109,7 +110,7 @@ class UNetDenoiser:
         return x
 
     def forward(self, x, t):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim == 3:
             x = x.reshape(1, *x.shape)
         if x.ndim == 2:
@@ -121,7 +122,7 @@ class UNetDenoiser:
                 x = x.reshape(B, 1, x.shape[1], 1)
 
         orig_shape = x.shape
-        t = np.asarray(t, dtype=np.float64).reshape(-1)
+        t = np.asarray(t, dtype=backend.default_dtype()).reshape(-1)
 
         # Time embedding
         t_emb = time_embedding(t, self.time_emb_dim)
@@ -169,7 +170,7 @@ class UNetDenoiser:
         (the padding was constant zero, disconnected from the input)."""
         B, C = delta.shape[0], delta.shape[1]
         copy_H, copy_W = min(H, target_H), min(W, target_W)
-        grad = np.zeros((B, C, H, W), dtype=np.float64)
+        grad = np.zeros((B, C, H, W), dtype=backend.default_dtype())
         grad[:, :, :copy_H, :copy_W] = delta[:, :, :copy_H, :copy_W]
         return grad
 
@@ -180,7 +181,7 @@ class UNetDenoiser:
         if H == target_H and W == target_W:
             return delta
         if H == 0 or W == 0:
-            return np.zeros((delta.shape[0], delta.shape[1], H, W), dtype=np.float64)
+            return np.zeros((delta.shape[0], delta.shape[1], H, W), dtype=backend.default_dtype())
         scale_h = max(1, target_H // H)
         scale_w = max(1, target_W // W)
         rep_H, rep_W = H * scale_h, W * scale_w
@@ -207,10 +208,10 @@ class UNetDenoiser:
         from ..backward import avgpool2d_backward
         from ._shared import _manual_sequential_backward, _conv_stack_input_gradient
 
-        grad_output = np.asarray(grad_output, dtype=np.float64)
+        grad_output = np.asarray(grad_output, dtype=backend.default_dtype())
         levels = self.levels
         t_emb_dim = self.time_net.outputs[-1].shape[1]
-        d_t_emb = np.zeros((grad_output.shape[0], t_emb_dim), dtype=np.float64)
+        d_t_emb = np.zeros((grad_output.shape[0], t_emb_dim), dtype=backend.default_dtype())
 
         def consume_time_add(delta, net):
             # `delta`: gradient w.r.t. a tensor that (if channel counts
@@ -299,7 +300,7 @@ class UNetDenoiser:
         """One DDPM training step: sample a random timestep per example,
         noise `x_0` accordingly, predict the noise via `forward()`, MSE
         loss against the true noise, backprop + update every subnetwork."""
-        x_0 = np.asarray(x_0, dtype=np.float64)
+        x_0 = np.asarray(x_0, dtype=backend.default_dtype())
         batch_size = x_0.shape[0]
         t = np.random.randint(0, self.time_steps, size=batch_size)
         noise = np.random.randn(*x_0.shape)
@@ -317,7 +318,7 @@ class UNetDenoiser:
         return loss
 
     def Train(self, X_train, epochs=10, batch_size=16, verbose=True):
-        X = np.asarray(X_train, dtype=np.float64)
+        X = np.asarray(X_train, dtype=backend.default_dtype())
         n_samples = X.shape[0]
         history = []
         for epoch in range(epochs):

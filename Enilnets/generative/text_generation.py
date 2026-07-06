@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 from ..text_utils import Tokenizer, create_sliding_windows
 from ..activations import activate
@@ -113,7 +114,7 @@ class TextGenerator:
     def _sample_token(self, probs, temperature=1.0, top_p=None, top_k=None, greedy=False):
         if greedy:
             return int(np.argmax(probs))
-        p = np.asarray(probs, dtype=np.float64).copy()
+        p = np.asarray(probs, dtype=backend.default_dtype()).copy()
         if temperature != 1.0:
             p = np.power(np.maximum(p, 1e-12), 1.0 / temperature)
             p = p / p.sum()
@@ -132,7 +133,7 @@ class TextGenerator:
             mask = np.zeros_like(p)
             mask[keep] = p[keep]
             p = mask / mask.sum()
-        return int(np.random.choice(len(p), p=p))
+        return int(np.random.choice(len(p), size=1, p=p)[0])
 
     def _kv_step(self, token_id, cache):
         """Run one new token through the network using cached per-layer K/V

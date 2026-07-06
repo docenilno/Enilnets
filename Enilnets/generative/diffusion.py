@@ -1,4 +1,6 @@
-import numpy as np
+import math
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 from .sampling import gaussian_sample
 from ._shared import _manual_sequential_backward
@@ -16,7 +18,7 @@ class DiffusionModel:
         self.time_steps = time_steps
         self.denoiser_type = denoiser_type
         self.flattened = len(data_shape) == 1
-        self.data_dim = data_shape[0] if self.flattened else int(np.prod(data_shape))
+        self.data_dim = data_shape[0] if self.flattened else math.prod(data_shape)
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.sample_clip_range = sample_clip_range
@@ -25,7 +27,7 @@ class DiffusionModel:
 
         # Noise schedule
         if beta_schedule == "linear":
-            self.betas = np.linspace(beta_start, beta_end, time_steps, dtype=np.float64)
+            self.betas = np.linspace(beta_start, beta_end, time_steps, dtype=backend.default_dtype())
         elif beta_schedule == "cosine":
             s = cosine_schedule_s
             t = np.arange(time_steps + 1) / time_steps
@@ -37,7 +39,7 @@ class DiffusionModel:
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = np.cumprod(self.alphas)
-        self.alphas_cumprod_prev = np.concatenate([[1.0], self.alphas_cumprod[:-1]])
+        self.alphas_cumprod_prev = np.concatenate([np.array([1.0]), self.alphas_cumprod[:-1]])
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
         self.sqrt_recip_alphas = np.sqrt(1.0 / self.alphas)
@@ -109,10 +111,10 @@ class DiffusionModel:
             y = np.repeat(y, n)
         if y.shape[0] != n:
             raise ValueError(f"y has {y.shape[0]} labels but batch size is {n}")
-        return np.eye(self.num_classes, dtype=np.float64)[y]
+        return np.eye(self.num_classes, dtype=backend.default_dtype())[y]
 
     def _time_embedding(self, t):
-        t = np.asarray(t, dtype=np.float64).reshape(-1)
+        t = np.asarray(t, dtype=backend.default_dtype()).reshape(-1)
         half = self.time_emb_dim // 2
         freqs = np.exp(-np.log(10000) * np.arange(half) / half)
         args = t[:, None] * freqs[None, :]
@@ -122,7 +124,7 @@ class DiffusionModel:
         return emb
 
     def _forward_diffusion(self, x_0, t):
-        x_0 = np.asarray(x_0, dtype=np.float64)
+        x_0 = np.asarray(x_0, dtype=backend.default_dtype())
         noise = np.random.randn(*x_0.shape)
         sqrt_acp = self.sqrt_alphas_cumprod[t].reshape(-1, *([1] * (x_0.ndim - 1)))
         sqrt_omacp = self.sqrt_one_minus_alphas_cumprod[t].reshape(-1, *([1] * (x_0.ndim - 1)))
@@ -163,14 +165,14 @@ class DiffusionModel:
         return result
 
     def train_step(self, x_0, y=None):
-        x_0 = np.asarray(x_0, dtype=np.float64)
+        x_0 = np.asarray(x_0, dtype=backend.default_dtype())
         batch_size = x_0.shape[0]
 
         t = np.random.randint(0, self.time_steps, size=batch_size)
         x_t, noise = self._forward_diffusion(x_0, t)
         pred_noise = self._predict_noise(x_t, t, use_ema=False, y=y)  # train on current weights
 
-        loss = np.mean((pred_noise - noise) ** 2)
+        loss = float(np.mean((pred_noise - noise) ** 2))
 
         delta = 2 * (pred_noise - noise) / batch_size
         if self.denoiser_type == "mlp":
@@ -184,7 +186,7 @@ class DiffusionModel:
         return loss
 
     def Train(self, X_train, epochs=10, batch_size=64, verbose=True, y_train=None):
-        X = np.asarray(X_train, dtype=np.float64)
+        X = np.asarray(X_train, dtype=backend.default_dtype())
         n_samples = X.shape[0]
         y_arr = None
         if y_train is not None:

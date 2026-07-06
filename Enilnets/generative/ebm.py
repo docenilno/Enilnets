@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 from .sampling import langevin_dynamics
 
@@ -24,7 +25,7 @@ class EnergyBasedModel:
             self.buffer_ptr = 0
 
     def energy(self, x):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
         elif x.ndim == 1:
@@ -33,7 +34,7 @@ class EnergyBasedModel:
 
     def _energy_grad(self, x):
         """Gradient of the scalar energy w.r.t. its input, via backprop."""
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim == 1:
             x = x.reshape(1, -1)
 
@@ -74,7 +75,7 @@ class EnergyBasedModel:
         return x_neg
 
     def train_step(self, x_data, n_cd_steps=10, step_size=0.1, noise_scale=0.005):
-        x_data = np.asarray(x_data, dtype=np.float64)
+        x_data = np.asarray(x_data, dtype=backend.default_dtype())
         if x_data.ndim > 2:
             x_data = x_data.reshape(x_data.shape[0], -1)
         elif x_data.ndim == 1:
@@ -99,7 +100,7 @@ class EnergyBasedModel:
 
     def Train(self, X_train, epochs=10, batch_size=64, n_cd_steps=10,
               step_size=0.1, noise_scale=0.005, verbose=True):
-        X = np.asarray(X_train, dtype=np.float64)
+        X = np.asarray(X_train, dtype=backend.default_dtype())
         if X.ndim > 2:
             X = X.reshape(X.shape[0], -1)
         n_samples = X.shape[0]

@@ -1,4 +1,5 @@
-import numpy as np
+from .backend import np
+from . import backend
 
 def _copy_layers(layers):
     """Copy only the ndarray values in each layer dict (fast) instead of
@@ -6,7 +7,7 @@ def _copy_layers(layers):
     that matters here is either an ndarray (needs its own buffer) or a
     plain/immutable value (safe to share)."""
     return [
-        {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in layer.items()}
+        {k: (v.copy() if backend.is_array(v) else v) for k, v in layer.items()}
         for layer in layers
     ]
 
@@ -15,7 +16,7 @@ def Evolve(self, inputs, score_fn, noise=0.05, tries=10, sigma=1.0):
     Evolutionary Strategy (ES). Perturbs network weights with Gaussian noise
     and keeps the best performing variant.
     """
-    inputs = np.asarray(inputs, dtype=np.float64)
+    inputs = np.asarray(inputs, dtype=backend.default_dtype())
     best_score = score_fn(self.Forward(inputs))
     best_layers = _copy_layers(self.layers)
     base_layers = _copy_layers(self.layers)
@@ -41,7 +42,7 @@ def compute_returns(rewards, gamma=0.99):
     """
     Compute discounted returns for a single episode.
     """
-    rewards = np.asarray(rewards, dtype=np.float64)
+    rewards = np.asarray(rewards, dtype=backend.default_dtype())
     returns = np.zeros_like(rewards)
     running = 0.0
     for t in reversed(range(len(rewards))):
@@ -53,9 +54,9 @@ def Reinforce(self, states, actions, returns, action_type="discrete", std=1.0, n
     """
     Real REINFORCE (Monte-Carlo Policy Gradient).
     """
-    states = np.asarray(states, dtype=np.float64)
+    states = np.asarray(states, dtype=backend.default_dtype())
     actions = np.asarray(actions)
-    returns_raw = np.asarray(returns, dtype=np.float64).reshape(-1, 1)
+    returns_raw = np.asarray(returns, dtype=backend.default_dtype()).reshape(-1, 1)
     returns = returns_raw.copy()
 
     if normalize_returns:
@@ -67,7 +68,7 @@ def Reinforce(self, states, actions, returns, action_type="discrete", std=1.0, n
     if action_type == "discrete":
         actions = actions.astype(int)
         num_actions = out.shape[-1]
-        one_hot = np.zeros((batch_size, num_actions), dtype=np.float64)
+        one_hot = np.zeros((batch_size, num_actions), dtype=backend.default_dtype())
         one_hot[np.arange(batch_size), actions] = 1.0
         output_delta = (out - one_hot) * returns / batch_size
     elif action_type == "continuous":
@@ -118,10 +119,10 @@ def PPO(self, states, actions, old_log_probs, advantages, action_type="discrete"
         with `value_targets`, it's trained via MSE*value_coeff right after
         the policy update.
     """
-    states = np.asarray(states, dtype=np.float64)
+    states = np.asarray(states, dtype=backend.default_dtype())
     actions = np.asarray(actions)
-    advantages = np.asarray(advantages, dtype=np.float64).reshape(-1, 1)
-    old_log_probs = np.asarray(old_log_probs, dtype=np.float64).reshape(-1, 1)
+    advantages = np.asarray(advantages, dtype=backend.default_dtype()).reshape(-1, 1)
+    old_log_probs = np.asarray(old_log_probs, dtype=backend.default_dtype()).reshape(-1, 1)
     batch_size = states.shape[0]
 
     out = self.Forward(states, training=True)
@@ -172,7 +173,7 @@ def PPO(self, states, actions, old_log_probs, advantages, action_type="discrete"
     self.update()
 
     if value_network is not None and value_targets is not None:
-        value_targets = np.asarray(value_targets, dtype=np.float64).reshape(-1, 1)
+        value_targets = np.asarray(value_targets, dtype=backend.default_dtype()).reshape(-1, 1)
         value_pred = value_network.Forward(states, training=True)
         value_delta = value_coeff * 2 * (value_pred - value_targets) / batch_size
         value_network.Backward(None, output_delta=value_delta)
@@ -199,10 +200,10 @@ def ActorCritic(self, states, actions, returns, values, action_type="discrete", 
     std : float
         Standard deviation for continuous actions
     """
-    states = np.asarray(states, dtype=np.float64)
+    states = np.asarray(states, dtype=backend.default_dtype())
     actions = np.asarray(actions)
-    returns = np.asarray(returns, dtype=np.float64).reshape(-1, 1)
-    values = np.asarray(values, dtype=np.float64).reshape(-1, 1)
+    returns = np.asarray(returns, dtype=backend.default_dtype()).reshape(-1, 1)
+    values = np.asarray(values, dtype=backend.default_dtype()).reshape(-1, 1)
     batch_size = states.shape[0]
 
     advantages = returns - values
@@ -212,7 +213,7 @@ def ActorCritic(self, states, actions, returns, values, action_type="discrete", 
     if action_type == "discrete":
         actions = actions.astype(int)
         num_actions = out.shape[-1]
-        one_hot = np.zeros((batch_size, num_actions), dtype=np.float64)
+        one_hot = np.zeros((batch_size, num_actions), dtype=backend.default_dtype())
         one_hot[np.arange(batch_size), actions] = 1.0
         output_delta = (out - one_hot) * advantages / batch_size
     elif action_type == "continuous":

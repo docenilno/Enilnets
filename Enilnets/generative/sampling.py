@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 
 def reparameterize(mu, logvar):
     """
@@ -45,7 +46,7 @@ def gumbel_softmax_sample(logits, temperature=1.0, hard=False):
 
 def random_mask(shape, ratio):
     """Generate a random boolean mask with given keep ratio."""
-    return (np.random.rand(*shape) < ratio).astype(np.float64)
+    return (np.random.rand(*shape) < ratio).astype(backend.default_dtype())
 
 def top_p_sampling(logits, p=0.9, temperature=1.0):
     """
@@ -65,27 +66,27 @@ def top_p_sampling(logits, p=0.9, temperature=1.0):
         valid_indices = sorted_indices[i, mask[i]]
         valid_probs = sorted_probs[i, mask[i]]
         valid_probs = valid_probs / np.sum(valid_probs)
-        choice = np.random.choice(valid_indices, p=valid_probs)
+        choice = np.random.choice(valid_indices, size=1, p=valid_probs)[0]
         result[i, choice] = 1.0
     return result
 
 def top_k_sampling(logits, k=10, temperature=1.0):
     """Top-k sampling for a single distribution: keep only the k highest
     logits, renormalize, and sample. logits: (vocab_size,)."""
-    logits = np.asarray(logits, dtype=np.float64)
+    logits = np.asarray(logits, dtype=backend.default_dtype())
     k = min(k, logits.shape[-1])
     top_idx = np.argpartition(logits, -k)[-k:]
     top_logits = logits[top_idx] / temperature
     top_logits -= np.max(top_logits)
     probs = np.exp(top_logits)
     probs /= probs.sum()
-    return int(np.random.choice(top_idx, p=probs))
+    return int(np.random.choice(top_idx, size=1, p=probs)[0])
 
 def compute_returns(rewards, gamma=0.99):
     """
     Compute discounted returns for a single episode.
     """
-    rewards = np.asarray(rewards, dtype=np.float64)
+    rewards = np.asarray(rewards, dtype=backend.default_dtype())
     returns = np.zeros_like(rewards)
     running = 0.0
     for t in reversed(range(len(rewards))):
@@ -102,10 +103,10 @@ def gae(rewards, values, gamma=0.99, lambda_=0.95):
     lambda_: GAE lambda parameter
     Returns advantages: (T,) and returns: (T,)
     """
-    rewards = np.asarray(rewards, dtype=np.float64)
-    values = np.asarray(values, dtype=np.float64)
+    rewards = np.asarray(rewards, dtype=backend.default_dtype())
+    values = np.asarray(values, dtype=backend.default_dtype())
     T = len(rewards)
-    advantages = np.zeros(T, dtype=np.float64)
+    advantages = np.zeros(T, dtype=backend.default_dtype())
     gae_t = 0.0
     for t in reversed(range(T)):
         delta = rewards[t] + gamma * values[t + 1] - values[t]

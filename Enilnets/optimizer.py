@@ -1,4 +1,4 @@
-import numpy as np
+from .backend import np
 from .forward import im2col, im2col1d
 
 # Which of each layer type's trainable params get weight decay (never biases,

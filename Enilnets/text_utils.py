@@ -2,7 +2,8 @@
 """
 Text preprocessing, tokenization, and dataset utilities for Enilnets.
 """
-import numpy as np
+from .backend import np
+from . import backend
 import re
 import os
 from collections import Counter
@@ -153,7 +154,7 @@ def create_sliding_windows(data, window_size, stride=1):
 
 def one_hot_encode(indices, vocab_size):
     """One-hot encode token indices."""
-    one_hot = np.zeros((len(indices), vocab_size), dtype=np.float64)
+    one_hot = np.zeros((len(indices), vocab_size), dtype=backend.default_dtype())
     one_hot[np.arange(len(indices)), indices] = 1.0
     return one_hot
 

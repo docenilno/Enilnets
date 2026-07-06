@@ -4,7 +4,8 @@ Pure NumPy image utilities for Enilnets.
 No external dependencies — reads/writes raw pixel arrays.
 Supports PPM format (simplest pure-numpy image format) and raw binary.
 """
-import numpy as np
+from .backend import np
+from . import backend
 import os
 import struct
 
@@ -39,7 +40,7 @@ def load_ppm(path):
             raise ValueError(f"Only maxval=255 supported, got {maxval}")
 
         raw = np.frombuffer(f.read(), dtype=np.uint8)
-        img = raw.reshape((height, width, 3)).astype(np.float64) / 255.0
+        img = raw.reshape((height, width, 3)).astype(backend.default_dtype()) / 255.0
         return img
 
 def save_ppm(arr, path):
@@ -77,7 +78,7 @@ def load_pgm(path):
         maxval = int(f.readline().strip())
 
         raw = np.frombuffer(f.read(), dtype=np.uint8)
-        img = raw.reshape((height, width)).astype(np.float64) / 255.0
+        img = raw.reshape((height, width)).astype(backend.default_dtype()) / 255.0
         return img
 
 def save_pgm(arr, path):
@@ -92,7 +93,7 @@ def save_pgm(arr, path):
         f.write(b'255\n')
         f.write(arr.tobytes())
 
-def load_raw_binary(path, shape, dtype=np.float64):
+def load_raw_binary(path, shape, dtype=None):
     """
     Load raw binary data as numpy array.
 
@@ -100,18 +101,21 @@ def load_raw_binary(path, shape, dtype=np.float64):
     ----------
     path : str
     shape : tuple
-    dtype : numpy dtype
+    dtype : numpy dtype, or None to use the current default working
+        precision (float32 unless use_float64(True) was called)
 
     Returns
     -------
     ndarray
     """
+    if dtype is None:
+        dtype = backend.default_dtype()
     arr = np.fromfile(path, dtype=dtype)
     return arr.reshape(shape)
 
 def save_raw_binary(arr, path):
     """Save numpy array as raw binary."""
-    arr.astype(np.float64).tofile(path)
+    arr.astype(backend.default_dtype()).tofile(path)
 
 def rgb_to_grayscale(rgb):
     """Convert RGB to grayscale using standard weights."""
@@ -201,7 +205,7 @@ def image_augmentation(images, flip_h=True, flip_v=False, rotate=0,
         angles = [0, 90, 180, 270]
         valid_angles = [a for a in angles if a <= rotate]
         for i in range(N):
-            angle = np.random.choice(valid_angles)
+            angle = int(np.random.choice(valid_angles, size=1)[0])
             if angle > 0:
                 k = angle // 90
                 aug[i] = np.rot90(aug[i], k=k, axes=(0, 1))
@@ -244,7 +248,7 @@ def images_to_patches(images, patch_size, stride=None):
     windows = windows[:, ::stride, ::stride]
     n_y, n_x = windows.shape[1], windows.shape[2]
     patches = windows.transpose(0, 1, 2, 4, 5, 3).reshape(N * n_y * n_x, patch_size, patch_size, C)
-    return np.ascontiguousarray(patches, dtype=np.float64)
+    return np.ascontiguousarray(patches, dtype=backend.default_dtype())
 
 def pad_image(img, pad_h, pad_w, mode='constant', constant_value=0):
     """

@@ -1,4 +1,4 @@
-import numpy as np
+from ..backend import np
 
 def kl_divergence_gaussian(mu, logvar, reduction="mean", kl_weight=1.0):
     """

@@ -3,7 +3,8 @@
 Pure NumPy audio utilities for Enilnets.
 No external dependencies — reads/writes raw WAV and computes spectrograms.
 """
-import numpy as np
+from .backend import np
+from . import backend
 import os
 import struct
 
@@ -74,7 +75,7 @@ def load_wav(path):
                 samples = raw[:, :, 0].astype(np.int32) | (raw[:, :, 1].astype(np.int32) << 8) | (raw[:, :, 2].astype(np.int32) << 16)
                 # Sign extend
                 samples = np.where(samples > 8388607, samples - 16777216, samples)
-                audio = samples.astype(np.float64) / 8388608.0
+                audio = samples.astype(backend.default_dtype()) / 8388608.0
                 if num_channels == 1:
                     audio = audio.squeeze(-1)
                 return audio, sample_rate
@@ -85,7 +86,7 @@ def load_wav(path):
                 raise ValueError(f"Unsupported bits per sample: {bits_per_sample}")
 
             samples = np.frombuffer(data_chunk, dtype=dtype)
-            audio = samples.astype(np.float64) / max_val
+            audio = samples.astype(backend.default_dtype()) / max_val
 
             if num_channels > 1:
                 audio = audio.reshape(-1, num_channels)
@@ -95,7 +96,7 @@ def load_wav(path):
         elif audio_format == 3:  # IEEE float
             if bits_per_sample == 32:
                 samples = np.frombuffer(data_chunk, dtype=np.float32)
-                audio = samples.astype(np.float64)
+                audio = samples.astype(backend.default_dtype())
                 if num_channels > 1:
                     audio = audio.reshape(-1, num_channels)
                 return audio, sample_rate
@@ -118,7 +119,7 @@ def save_wav(audio, path, sr, bits_per_sample=16):
     bits_per_sample : int
         16 or 32
     """
-    audio = np.asarray(audio, dtype=np.float64)
+    audio = np.asarray(audio, dtype=backend.default_dtype())
 
     if audio.ndim == 1:
         num_channels = 1
@@ -227,8 +228,8 @@ def istft(spectrogram, n_fft=2048, hop_length=512, window='hann', length=None):
     n_frames = spectrogram.shape[1]
     expected_length = hop_length * (n_frames - 1) + n_fft
 
-    audio = np.zeros(expected_length, dtype=np.float64)
-    window_sum = np.zeros(expected_length, dtype=np.float64)
+    audio = np.zeros(expected_length, dtype=backend.default_dtype())
+    window_sum = np.zeros(expected_length, dtype=backend.default_dtype())
 
     for i in range(n_frames):
         frame = np.fft.irfft(spectrogram[:, i], n=n_fft) * win
@@ -343,7 +344,7 @@ def audio_to_frames(audio, frame_length, hop_length=None):
 
     n_samples = len(audio)
     n_frames = 1 + (n_samples - frame_length) // hop_length
-    frames = np.zeros((n_frames, frame_length), dtype=np.float64)
+    frames = np.zeros((n_frames, frame_length), dtype=backend.default_dtype())
 
     for i in range(n_frames):
         start = i * hop_length
@@ -355,8 +356,8 @@ def frames_to_audio(frames, hop_length, window='hann'):
     """Reconstruct audio from overlapping frames (OLA)."""
     n_frames, frame_length = frames.shape
     output_length = (n_frames - 1) * hop_length + frame_length
-    audio = np.zeros(output_length, dtype=np.float64)
-    window_sum = np.zeros(output_length, dtype=np.float64)
+    audio = np.zeros(output_length, dtype=backend.default_dtype())
+    window_sum = np.zeros(output_length, dtype=backend.default_dtype())
 
     if window == 'hann':
         win = np.hanning(frame_length)
@@ -391,7 +392,7 @@ def augment_audio(audio, sr, pitch_shift=0, time_stretch=1.0, noise_std=0.0):
         indices_int = indices.astype(int)
         frac = indices - indices_int
         aug = aug[indices_int] * (1 - frac) + aug[np.minimum(indices_int + 1, len(aug) - 1)] * frac
-        aug = aug.astype(np.float64)
+        aug = aug.astype(backend.default_dtype())
 
     if time_stretch != 1.0:
         # Linear interpolation for time stretching
@@ -400,7 +401,7 @@ def augment_audio(audio, sr, pitch_shift=0, time_stretch=1.0, noise_std=0.0):
         indices_int = indices.astype(int)
         frac = indices - indices_int
         aug = aug[indices_int] * (1 - frac) + aug[np.minimum(indices_int + 1, len(aug) - 1)] * frac
-        aug = aug.astype(np.float64)
+        aug = aug.astype(backend.default_dtype())
 
     if noise_std > 0:
         aug = aug + np.random.normal(0, noise_std, aug.shape)

@@ -3,7 +3,8 @@ Classification evaluation utilities: confusion matrix and a per-class
 precision/recall/F1 report, generalizing train.py's binary-only
 compute_precision_recall_f1 to the multi-class case.
 """
-import numpy as np
+from .backend import np
+from . import backend
 
 
 def confusion_matrix(y_true, y_pred, num_classes=None):
@@ -31,12 +32,21 @@ def classification_report(y_true, y_pred, num_classes=None):
     tp = np.diag(cm)
     predicted_positives = cm.sum(axis=0)
 
-    precision = np.divide(tp, predicted_positives, out=np.zeros(n_classes, dtype=np.float64),
-                          where=predicted_positives != 0)
-    recall = np.divide(tp, support, out=np.zeros(n_classes, dtype=np.float64), where=support != 0)
+    # np.divide's `where=` kwarg (used to avoid 0/0 without a separate mask
+    # step) isn't supported by CuPy's ufuncs, so these do an explicit
+    # boolean-mask assignment instead -- works identically on both backends.
+    precision = np.zeros(n_classes, dtype=backend.default_dtype())
+    mask = predicted_positives != 0
+    precision[mask] = tp[mask] / predicted_positives[mask]
+
+    recall = np.zeros(n_classes, dtype=backend.default_dtype())
+    mask = support != 0
+    recall[mask] = tp[mask] / support[mask]
+
     f1_denom = precision + recall
-    f1 = np.divide(2 * precision * recall, f1_denom, out=np.zeros(n_classes, dtype=np.float64),
-                   where=f1_denom != 0)
+    f1 = np.zeros(n_classes, dtype=backend.default_dtype())
+    mask = f1_denom != 0
+    f1[mask] = (2 * precision * recall)[mask] / f1_denom[mask]
 
     report = {}
     for c in range(n_classes):

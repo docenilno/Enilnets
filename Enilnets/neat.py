@@ -8,9 +8,19 @@ innovations from being immediately outcompeted. This doesn't reuse
 `NeuralNet`, since NEAT genomes are variable-topology graphs rather than a
 fixed stack of layers -- a `Genome` is its own minimal feedforward network
 representation with its own `forward()`.
+
+Note on GPU mode: `Genome.forward()` evaluates nodes one at a time in
+Python-level topological order, and mutation operators work on individual
+Python-scalar weights. This is not a batched, matmul-heavy workload, so
+enabling GPU mode (`Enilnets.use_gpu(True)`) is not expected to speed up
+NEAT and may be slower than CPU due to per-node kernel-launch overhead --
+GPU acceleration here primarily benefits `NeuralNet`'s batched
+Forward/Backward/optimizer path.
 """
+import statistics
 from collections import deque
-import numpy as np
+from .backend import np
+from . import backend
 from .activations import activate
 from . import constants
 
@@ -106,7 +116,7 @@ class Genome:
         for i in genome.input_ids + [genome.bias_id]:
             for j in genome.output_ids:
                 innov = innovation_tracker.get_connection_innovation(i, j)
-                w = np.random.uniform(-weight_range, weight_range)
+                w = float(np.random.uniform(-weight_range, weight_range))
                 genome.connections[innov] = ConnectionGene(i, j, w, True, innov)
         return genome
 
@@ -165,7 +175,7 @@ class Genome:
     def forward(self, x):
         """x: (n_inputs,) or (batch, n_inputs). Returns matching-rank output
         of shape (n_outputs,) or (batch, n_outputs)."""
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         single = x.ndim == 1
         if single:
             x = x.reshape(1, -1)
@@ -177,14 +187,14 @@ class Genome:
                 incoming.setdefault(conn.out_node, []).append((conn.in_node, conn.weight))
 
         values = {i: x[:, i] for i in range(self.n_inputs)}
-        values[self.bias_id] = np.ones(batch, dtype=np.float64)
+        values[self.bias_id] = np.ones(batch, dtype=backend.default_dtype())
 
         for nid in self._topo_order():
             node = self.nodes[nid]
             if node.type in ("input", "bias"):
                 continue
             srcs = incoming.get(nid)
-            s = np.zeros(batch, dtype=np.float64) if not srcs else \
+            s = np.zeros(batch, dtype=backend.default_dtype()) if not srcs else \
                 sum(values[src] * w for src, w in srcs)
             values[nid] = activate(node.activation, s)
 
@@ -199,9 +209,9 @@ class Genome:
             if np.random.rand() >= rate:
                 continue
             if np.random.rand() < perturb_rate:
-                conn.weight += np.random.randn() * perturb_power
+                conn.weight += float(np.random.randn()) * perturb_power
             else:
-                conn.weight = np.random.uniform(-replace_range, replace_range)
+                conn.weight = float(np.random.uniform(-replace_range, replace_range))
 
     def _creates_cycle(self, in_node, out_node):
         if in_node == out_node:
@@ -228,14 +238,14 @@ class Genome:
         node_ids = list(self.nodes.keys())
         existing = {(c.in_node, c.out_node) for c in self.connections.values()}
         for _ in range(max_tries):
-            a = node_ids[np.random.randint(len(node_ids))]
-            b = node_ids[np.random.randint(len(node_ids))]
+            a = node_ids[int(np.random.randint(len(node_ids)))]
+            b = node_ids[int(np.random.randint(len(node_ids)))]
             if self.nodes[b].type in ("input", "bias"):
                 continue
             if (a, b) in existing or self._creates_cycle(a, b):
                 continue
             innov = innovation_tracker.get_connection_innovation(a, b)
-            w = np.random.uniform(-weight_range, weight_range)
+            w = float(np.random.uniform(-weight_range, weight_range))
             self.connections[innov] = ConnectionGene(a, b, w, True, innov)
             return True
         return False
@@ -248,7 +258,7 @@ class Genome:
         enabled = [c for c in self.connections.values() if c.enabled]
         if not enabled:
             return False
-        conn = enabled[np.random.randint(len(enabled))]
+        conn = enabled[int(np.random.randint(len(enabled)))]
         conn.enabled = False
 
         new_id = innovation_tracker.get_node_for_split(conn.innovation)
@@ -277,8 +287,8 @@ class Genome:
         excess = sum(1 for i in only_a if i > lower_max) + sum(1 for i in only_b if i > lower_max)
 
         if matching:
-            weight_diff = float(np.mean([abs(self.connections[i].weight - other.connections[i].weight)
-                                         for i in matching]))
+            weight_diff = statistics.mean(abs(self.connections[i].weight - other.connections[i].weight)
+                                           for i in matching)
         else:
             weight_diff = 0.0
 
@@ -400,7 +410,7 @@ class NEATPopulation:
                 self.species.append(sp)
         self.species = [sp for sp in self.species if sp.members]
         for sp in self.species:
-            sp.representative = sp.members[np.random.randint(len(sp.members))].copy()
+            sp.representative = sp.members[int(np.random.randint(len(sp.members)))].copy()
 
     def evolve(self, fitness_fn, generations=100, verbose=True):
         """fitness_fn(genome) -> float, higher is better. Returns a list of
@@ -444,12 +454,12 @@ class NEATPopulation:
                 parents = ranked[:n_parents]
                 for _ in range(n_offspring):
                     if len(parents) > 1 and np.random.rand() < self.crossover_rate:
-                        pa, pb = parents[np.random.randint(len(parents))], parents[np.random.randint(len(parents))]
+                        pa, pb = parents[int(np.random.randint(len(parents)))], parents[int(np.random.randint(len(parents)))]
                         if pa.fitness < pb.fitness:
                             pa, pb = pb, pa
                         child = crossover(pa, pb)
                     else:
-                        child = parents[np.random.randint(len(parents))].copy()
+                        child = parents[int(np.random.randint(len(parents)))].copy()
                     if np.random.rand() < self.add_connection_rate:
                         child.mutate_add_connection(self.innovation_tracker)
                     if np.random.rand() < self.add_node_rate:
@@ -458,7 +468,7 @@ class NEATPopulation:
                     new_genomes.append(child)
 
             while len(new_genomes) < self.population_size:
-                parent = self.genomes[np.random.randint(len(self.genomes))]
+                parent = self.genomes[int(np.random.randint(len(self.genomes)))]
                 child = parent.copy()
                 child.mutate_weights(self.weight_mutate_rate, self.weight_perturb_rate, self.weight_perturb_power)
                 new_genomes.append(child)

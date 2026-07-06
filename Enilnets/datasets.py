@@ -4,7 +4,8 @@ their usual sources), these just parse the on-disk byte layout.
 """
 import struct
 import pickle
-import numpy as np
+from .backend import np
+from . import backend
 
 
 def load_mnist(images_path, labels_path, normalize=False):
@@ -42,7 +43,7 @@ def load_mnist(images_path, labels_path, normalize=False):
     if num_images != num_labels:
         raise ValueError(f"images file has {num_images} images but labels file has {num_labels} labels.")
 
-    X = image_data.reshape(num_images, 1, num_rows, num_cols).astype(np.float64)
+    X = image_data.reshape(num_images, 1, num_rows, num_cols).astype(backend.default_dtype())
     if normalize:
         X = X / 255.0
     return X, y
@@ -78,7 +79,7 @@ def load_cifar10(batch_paths, normalize=False):
         X_list.append(np.asarray(batch[b"data"], dtype=np.uint8))
         y_list.append(np.asarray(batch[b"labels"], dtype=np.int64))
 
-    X = np.concatenate(X_list, axis=0).astype(np.float64).reshape(-1, 3, 32, 32)
+    X = np.concatenate(X_list, axis=0).astype(backend.default_dtype()).reshape(-1, 3, 32, 32)
     y = np.concatenate(y_list, axis=0)
     if normalize:
         X = X / 255.0

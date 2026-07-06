@@ -1,4 +1,4 @@
-import numpy as np
+from .backend import np
 from .utils import iterate_minibatches
 
 def TrainBatch(self, xs, ys, loss_function=None, accumulation_steps=1, **loss_kwargs):

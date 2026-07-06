@@ -2,12 +2,18 @@
 General-purpose utility functions: reproducibility, data prep, training
 helpers, and introspection. Pure NumPy, no external dependencies.
 """
-import numpy as np
+from .backend import np
 from .text_utils import one_hot_encode as one_hot
 
 
 def set_seed(seed):
-    """Seed NumPy's global RNG for reproducible runs."""
+    """Seed the active backend's global RNG for reproducible runs.
+
+    Reproducibility is only guaranteed within one backend: NumPy's legacy
+    Mersenne Twister and CuPy's cuRAND-backed generator do not produce
+    identical sequences for the same seed, so don't expect CPU and GPU
+    runs with the same seed to match bit-for-bit.
+    """
     np.random.seed(seed)
 
 

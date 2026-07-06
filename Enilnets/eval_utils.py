@@ -3,7 +3,7 @@
 Pure NumPy evaluation metrics for generative models.
 No external dependencies.
 """
-import numpy as np
+from .backend import np
 
 def inception_score(samples, classifier=None, splits=10):
     """
@@ -61,6 +61,7 @@ def inception_score(samples, classifier=None, splits=10):
             kl = p_yx * (np.log(p_yx + 1e-12) - np.log(p_y + 1e-12))
             split_scores.append(np.exp(kl.sum(axis=1).mean()))
 
+    split_scores = np.array(split_scores)
     return float(np.mean(split_scores)), float(np.std(split_scores))
 
 def frechet_distance(mu1, sigma1, mu2, sigma2):

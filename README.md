@@ -1,16 +1,19 @@
 # Enilnets
 
-**A neural network library built entirely on NumPy.** No PyTorch, no
-TensorFlow, no GPU, no C extensions — every layer, optimizer, loss,
-generative model, reinforcement-learning algorithm, and evolutionary
-algorithm is implemented from scratch with plain array math. If you want to
-*see* exactly what happens to your data and gradients, line by line, in
-readable Python, this is that library.
+**A neural network library built entirely on NumPy, with an optional CuPy
+GPU backend.** No PyTorch, no TensorFlow, no C extensions — every layer,
+optimizer, loss, generative model, reinforcement-learning algorithm, and
+evolutionary algorithm is implemented from scratch with plain array math.
+If you want to *see* exactly what happens to your data and gradients, line
+by line, in readable Python, this is that library. NumPy (CPU) is always
+the default and requires nothing extra to install; CuPy (GPU) is a
+one-line opt-in for anyone who has it — see
+[GPU mode (optional)](#gpu-mode-optional) below.
 
 - **GitHub:** https://github.com/docenilno/Enilnets
 - **License:** MIT
-- **Version:** 3.1.0
-- **Dependencies:** NumPy only
+- **Version:** 4.1.0
+- **Dependencies:** NumPy (required), CuPy (optional, for GPU mode)
 
 This README is a complete guide, not just a reference: it explains what
 each piece is *for*, when to reach for it, how to size it for your
@@ -22,6 +25,8 @@ with [Choosing the right model for your task](#choosing-the-right-model-for-your
 ## Table of contents
 
 - [Install](#install)
+- [GPU mode (optional)](#gpu-mode-optional)
+- [Precision: float32 vs float64](#precision-float32-vs-float64)
 - [Quickstart](#quickstart)
 - [Choosing the right model for your task](#choosing-the-right-model-for-your-task)
   - [Structured / tabular data](#structured--tabular-data)
@@ -112,8 +117,104 @@ pip install enilnets
 
 ```python
 import Enilnets
-print(Enilnets.__version__)  # "3.1.0"
+print(Enilnets.__version__)  # "4.1.0"
 ```
+
+## GPU mode (optional)
+
+Enilnets runs on plain NumPy by default — nothing to configure, nothing
+extra to install. If you have an NVIDIA GPU and want to accelerate
+training, install a [CuPy](https://cupy.dev/) wheel matching your CUDA
+toolkit version (pick one):
+
+```bash
+pip install cupy-cuda12x   # CUDA 12.x
+pip install cupy-cuda13x   # CUDA 13.x
+```
+
+Then, **before building any models**, switch on GPU mode:
+
+```python
+import Enilnets
+
+Enilnets.use_gpu(True)   # raises if CuPy isn't installed or no GPU is visible
+print(Enilnets.is_gpu_enabled())  # True
+
+net = Enilnets.NeuralNet(learning_rate=0.001)
+net.add_dense(784, 128, activation="relu")
+net.add_dense(128, 10, activation="softmax")
+# weights, forward/backward, and optimizer state all live on the GPU from here on
+```
+
+Nothing else about the API changes — every `add_*` call, `Forward`,
+`TrainBatch`, `Save`/`Load`, etc. works exactly the same whether the active
+backend is NumPy or CuPy. A few things to know:
+
+- **`use_gpu()` is a single global switch**, not a per-model setting. Call
+  it once before constructing any models; every model built afterward
+  shares the active backend. Mixing backends across models in the same
+  process isn't supported.
+- **Reproducibility is per-backend.** `set_seed(n)` seeds whichever
+  backend is currently active, but NumPy's legacy RNG and CuPy's
+  cuRAND-backed generator don't produce identical sequences for the same
+  seed — don't expect a CPU run and a GPU run with the same seed to match
+  bit-for-bit.
+- **Saved models are backend-agnostic.** `Save`/`Load` always round-trip
+  through host NumPy arrays regardless of which backend built the model,
+  so a `.pkl`/`.json` file saved on GPU loads fine on a CPU-only machine
+  and vice versa.
+- **GPU mode mainly benefits `NeuralNet`'s batched Forward/Backward/
+  optimizer path** (dense/conv/attention/RNN layers, large batches). NEAT
+  (`NEATPopulation`/`Genome`) evaluates one node at a time in a Python
+  loop and is not expected to benefit from GPU mode — it may even be
+  slower due to per-node kernel-launch overhead.
+- Check `Enilnets.gpu_available()` to see if CuPy + a CUDA device are both
+  available before calling `use_gpu(True)`, if you want to fail gracefully
+  instead of catching the `RuntimeError`.
+
+## Precision: float32 vs float64
+
+**float32 is the default working precision** for every weight, activation,
+and gradient in the library — the same default every mainstream deep
+learning framework uses, and the one that makes GPU mode (above) actually
+fast (consumer GPUs deliberately cripple float64 throughput to a fraction
+of their float32 rate). If you need float64 instead — more numerically
+sensitive work, matching an existing float64 pipeline, or just wanting the
+old default back — switch it on the same way as GPU mode:
+
+```python
+import Enilnets
+
+Enilnets.use_float64(True)   # before building any models
+print(Enilnets.default_dtype())     # <class 'numpy.float64'>
+print(Enilnets.is_float64_enabled())  # True
+
+net = Enilnets.NeuralNet(learning_rate=0.001)
+net.add_dense(784, 128, activation="relu")
+# weights and activations are float64 from here on
+```
+
+A few things to know:
+
+- **`use_float64()` is a single global switch**, same rule as `use_gpu()`:
+  call it once before constructing any models; every model built
+  afterward uses the active default. Mixing precisions across models in
+  the same process isn't supported.
+- **`use_mixed_precision=True`** (a `NeuralNet` constructor flag) forces
+  the dense/conv matmul down to float32 specifically, regardless of the
+  active default — meaningful when running in float64 mode (a real BLAS
+  speedup on the hot path, master weights/gradients stay float64), a
+  no-op if float32 is already the default.
+- **Saved models are precision-faithful.** `Save`/`Load` record which
+  dtype was active when a model was saved and always restore at that
+  dtype, regardless of the *current* default when you call `Load` — a
+  model saved under float32 loads back as float32 even after a later
+  `use_float64(True)`, and vice versa. Files saved by versions before this
+  existed (always float64) still load correctly.
+- **Gradient/precision-sensitive work may want float64 explicitly** —
+  finite-difference-style numerical checks, ill-conditioned optimization,
+  or anything accumulating many small updates over a long run can lose
+  meaningful precision in float32.
 
 ## Quickstart
 
@@ -1295,11 +1396,15 @@ approximation for adaptive optimizers.
 ```python
 model = NeuralNet(optimizer="adam", use_mixed_precision=True)
 ```
-Runs the dense/conv2d matmuls in float32 while keeping master weights at
-float64, for a real BLAS speedup — a lightweight CPU approximation of the
-GPU technique of the same name. Expect outputs close to, not bit-identical
-to, the float64 path. Turn this on if training speed matters more than
-bit-exact reproducibility.
+Forces the dense/conv2d matmuls to run in float32 specifically,
+regardless of whatever the active default precision is (see
+[Precision: float32 vs float64](#precision-float32-vs-float64)) — a real
+BLAS speedup on the hot path when running in float64 mode (master
+weights/gradients stay float64), and a no-op if float32 is already the
+default. Expect outputs close to, not bit-identical to, the float64 path
+when this actually changes the compute dtype. Turn this on if you're
+running in float64 mode and training speed matters more than bit-exact
+reproducibility.
 
 ### Learning rate schedules
 
@@ -2109,7 +2214,7 @@ from Enilnets import image_utils
 
 image_utils.load_ppm(path) / image_utils.save_ppm(arr, path)     # binary P6 only, maxval must be 255
 image_utils.load_pgm(path) / image_utils.save_pgm(arr, path)     # binary P5 only
-image_utils.load_raw_binary(path, shape, dtype=np.float64) / image_utils.save_raw_binary(arr, path)
+image_utils.load_raw_binary(path, shape, dtype=None) / image_utils.save_raw_binary(arr, path)  # dtype=None uses the active default precision
 image_utils.rgb_to_grayscale(rgb) / image_utils.grayscale_to_rgb(gray)
 image_utils.resize_nearest_neighbor(img, new_height, new_width)
 image_utils.resize_bilinear(img, new_height, new_width)
@@ -2175,12 +2280,14 @@ fetch of any kind; you download the files yourself (MNIST from
 `https://www.cs.toronto.edu/~kriz/cifar.html`) and pass their paths.
 
 - **`load_mnist`**: parses the standard IDX binary format. Returns `X` as
-  `(N, 1, 28, 28)` float64 and `y` as `(N,)` int64 class labels.
+  `(N, 1, 28, 28)` at the active default precision (float32 unless
+  `use_float64(True)` was called) and `y` as `(N,)` int64 class labels.
   `normalize=True` divides by `255.0` — for z-score normalization instead,
   call `image_utils.normalize_images(X)` yourself after loading.
 - **`load_cifar10`**: unpickles standard CIFAR-10 batch files. Returns `X`
-  as `(N, 3, 32, 32)` float64 — **channel-major**, matching CIFAR-10's
-  actual on-disk layout — and `y` as `(N,)` int64 labels.
+  as `(N, 3, 32, 32)` at the active default precision — **channel-major**,
+  matching CIFAR-10's actual on-disk layout — and `y` as `(N,)` int64
+  labels.
 - Both loaders raise `ValueError` on a corrupt/unexpected file.
 
 ## Model persistence
@@ -2324,9 +2431,18 @@ a direct import), `Enilnets.io`, `Enilnets.reinforce`, `Enilnets.forward`,
 A consolidated list of every rough edge documented above, so you can decide
 up front whether they matter for your use case:
 
-- **No GPU support, by design.** Everything is NumPy on CPU. Large
-  models/datasets will be slow compared to any GPU-backed framework — this
-  library trades speed for full transparency/hackability.
+- **GPU support is opt-in, not automatic.** NumPy/CPU is the default;
+  CuPy/GPU requires installing CuPy yourself and calling
+  `Enilnets.use_gpu(True)` — see [GPU mode (optional)](#gpu-mode-optional).
+  Even with GPU mode on, this is still a from-scratch, readable
+  implementation, not a fused/optimized kernel library — it trades some
+  speed for full transparency/hackability either way.
+- **float32 is the default working precision, not float64** — call
+  `Enilnets.use_float64(True)` if you need the old default back, see
+  [Precision: float32 vs float64](#precision-float32-vs-float64). Numerical
+  work sensitive to float32's ~7 decimal digits (e.g. hand-rolled
+  finite-difference gradient checks against this library) should opt into
+  float64 explicitly rather than assume it.
 - **`UNetDenoiser`'s time embedding often silently doesn't reach most
   blocks** — see [UNetDenoiser](#unetdenoiser) above.
 - **`vgg_loss`/`build_vgg16_feature_extractor` need your own pretrained

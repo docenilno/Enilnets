@@ -1,7 +1,7 @@
 import json
 import pickle
 import os
-import numpy as np
+from . import backend
 
 # Every layer dict key whose value is a weight/statistic array that must
 # round-trip as a numpy array (JSON has no array type, so these come back as
@@ -13,11 +13,29 @@ _LAYER_ARRAY_KEYS = [
 ]
 
 def _numpy_encoder(obj):
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
+    if backend.is_array(obj):
+        return backend.to_numpy(obj).tolist()
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-def _restore_grad_accum(raw_accum):
+def _host_layers(layers):
+    """Return layer dicts with every array value moved to host NumPy, so
+    save files stay backend-agnostic (portable between CPU and GPU runs,
+    and safe to pickle regardless of which backend built the model)."""
+    return [
+        {k: (backend.to_numpy(v) if backend.is_array(v) else v) for k, v in layer.items()}
+        for layer in layers
+    ]
+
+def _host_state_list(states):
+    """Same host-conversion as _host_layers, for opt_state/grad_accum lists
+    of dicts (or None entries)."""
+    return [
+        None if state is None else
+        {k: (backend.to_numpy(v) if backend.is_array(v) else v) for k, v in state.items()}
+        for state in states
+    ]
+
+def _restore_grad_accum(raw_accum, dtype):
     if not raw_accum:
         return []
     restored = []
@@ -25,7 +43,7 @@ def _restore_grad_accum(raw_accum):
         if entry is None:
             restored.append(None)
         else:
-            restored.append({k: np.array(v, dtype=np.float64) for k, v in entry.items()})
+            restored.append({k: backend.np.array(v, dtype=dtype) for k, v in entry.items()})
     return restored
 
 def Save(self, file, save_opt_state=True, extra_state=None):
@@ -48,8 +66,9 @@ def Save(self, file, save_opt_state=True, extra_state=None):
         Additional state to save (e.g., EMA weights, persistent CD buffer)
     """
     payload = {
-        "version": 5,
-        "layers": self.layers,
+        "version": 6,
+        "dtype": backend.np.dtype(backend.default_dtype()).name,
+        "layers": _host_layers(self.layers),
         "optimizer": self.optimizer_type,
         "learning_rate": self.learning_rate,
         "l2_lambda": self.l2_lambda,
@@ -65,14 +84,14 @@ def Save(self, file, save_opt_state=True, extra_state=None):
         "t": self.t,
         "training": self.training,
         "accum_steps": self._accum_steps,
-        "grad_accum": self._grad_accum,
+        "grad_accum": _host_state_list(self._grad_accum),
         "last_width": self._last_width,
         "last_spatial": self._last_spatial,
         "last_spatial_1d": self._last_spatial_1d,
         "residual_stack": self._residual_stack,
     }
     if save_opt_state:
-        payload["opt_state"] = self.opt_state
+        payload["opt_state"] = _host_state_list(self.opt_state)
     if extra_state is not None:
         payload["extra_state"] = extra_state
 
@@ -110,11 +129,19 @@ def Load(self, file, load_opt_state=True):
         with open(file, "r") as f:
             raw = json.load(f)
 
+    # Save files record the dtype that was active when they were written
+    # (payload "dtype" field, added in version 6) so a round-trip is
+    # dtype-faithful regardless of the *current* default -- a model saved
+    # under float32 loads back as float32 even if use_float64(True) has
+    # since been called, and vice versa. Files saved before this field
+    # existed were always float64, so that's the fallback.
+    dtype = getattr(backend.np, raw.get("dtype", "float64"))
+
     self.layers = []
     for l in raw.get("layers", []):
         for k in _LAYER_ARRAY_KEYS:
             if k in l:
-                l[k] = np.array(l[k], dtype=np.float64)
+                l[k] = backend.np.array(l[k], dtype=dtype)
         self.layers.append(l)
 
     self.opt_state = []
@@ -126,7 +153,7 @@ def Load(self, file, load_opt_state=True):
                 restored = {}
                 for k, v in state.items():
                     if isinstance(v, list):
-                        restored[k] = np.array(v, dtype=np.float64)
+                        restored[k] = backend.np.array(v, dtype=dtype)
                     else:
                         restored[k] = v
                 self.opt_state.append(restored)
@@ -146,7 +173,7 @@ def Load(self, file, load_opt_state=True):
     self.adagrad_epsilon = raw.get("adagrad_epsilon", self.adagrad_epsilon)
     self.training = raw.get("training", self.training)
     self._accum_steps = raw.get("accum_steps", 0)
-    self._grad_accum = _restore_grad_accum(raw.get("grad_accum"))
+    self._grad_accum = _restore_grad_accum(raw.get("grad_accum"), dtype)
     self._last_width = raw.get("last_width", self._last_width)
     last_spatial = raw.get("last_spatial")
     if last_spatial is not None:

@@ -3,7 +3,7 @@
 Cross-modal model utilities for Enilnets.
 Supports image-text alignment, audio-text alignment, and multimodal generation.
 """
-import numpy as np
+from .backend import np
 
 def contrastive_loss(image_embeds, text_embeds, temperature=0.07):
     """

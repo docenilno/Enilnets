@@ -1,4 +1,5 @@
-import numpy as np
+from ..backend import np
+from .. import backend
 from ..base import NeuralNet
 from .sampling import reparameterize
 from .generative_loss import kl_divergence_gaussian
@@ -45,10 +46,10 @@ class VAE:
             y = np.repeat(y, n)
         if y.shape[0] != n:
             raise ValueError(f"y has {y.shape[0]} labels but batch size is {n}")
-        return np.eye(self.num_classes, dtype=np.float64)[y]
+        return np.eye(self.num_classes, dtype=backend.default_dtype())[y]
 
     def encode(self, x, y=None):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
         elif x.ndim == 1:
@@ -62,7 +63,7 @@ class VAE:
         return mu, logvar
 
     def decode(self, z, y=None):
-        z = np.asarray(z, dtype=np.float64)
+        z = np.asarray(z, dtype=backend.default_dtype())
         if z.ndim == 1:
             z = z.reshape(1, -1)
         onehot = self._onehot(y, z.shape[0])
@@ -79,17 +80,17 @@ class VAE:
     def loss(self, x, recon=None, mu=None, logvar=None, kl_weight=1.0, y=None):
         if recon is None:
             recon, mu, logvar, _ = self.forward(x, y=y)
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
 
         recon = np.clip(recon, 1e-12, 1 - 1e-12)
         recon_loss = -np.mean(x * np.log(recon) + (1 - x) * np.log(1 - recon))
         kl = kl_divergence_gaussian(mu, logvar, reduction="mean", kl_weight=kl_weight)
-        return recon_loss + kl
+        return float(recon_loss + kl)
 
     def train_step(self, x, kl_weight=1.0, y=None):
-        x = np.asarray(x, dtype=np.float64)
+        x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
         elif x.ndim == 1:
@@ -127,7 +128,7 @@ class VAE:
         return self.loss(x, recon, mu, logvar, kl_weight=kl_weight, y=y)
 
     def Train(self, X_train, epochs=10, batch_size=64, verbose=True, kl_weight=1.0, y_train=None):
-        X = np.asarray(X_train, dtype=np.float64)
+        X = np.asarray(X_train, dtype=backend.default_dtype())
         if X.ndim > 2:
             X = X.reshape(X.shape[0], -1)
         n_samples = X.shape[0]

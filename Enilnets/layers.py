@@ -1,4 +1,6 @@
-import numpy as np
+import math
+from .backend import np
+from . import backend
 from .weight_init import init_weights, init_conv_weights, init_conv1d_weights, init_embedding_weights
 
 def _require_width(self, what):
@@ -15,7 +17,7 @@ def add_dense(self, n_in=None, n_out=128, activation="relu", init_method="xavier
         n_in = _require_width(self, "add_dense")
     w, b = init_weights(n_in, n_out, method=init_method)
     if not use_bias:
-        b = np.zeros(n_out, dtype=np.float64)
+        b = np.zeros(n_out, dtype=backend.default_dtype())
     self.layers.append({"type": "dense", "weights": w, "bias": b, "activation": activation,
                         "use_bias": use_bias, "activation_params": activation_params or {}})
     self._last_width = n_out
@@ -27,7 +29,7 @@ def add_sparse(self, n_in=None, n_out=128, connectivity=0.5, activation="relu",
     if n_in is None:
         n_in = _require_width(self, "add_sparse")
     w, b = init_weights(n_in, n_out, method=init_method)
-    mask = (np.random.rand(n_out, n_in) < connectivity).astype(np.float64)
+    mask = (np.random.rand(n_out, n_in) < connectivity).astype(backend.default_dtype())
     self.layers.append({"type": "sparse", "weights": w * mask, "bias": b, "mask": mask,
                         "activation": activation, "activation_params": activation_params or {}})
     self._last_width = n_out
@@ -165,10 +167,10 @@ def add_batchnorm(self, num_features=None, epsilon=1e-5, momentum=0.1):
     if num_features is None:
         num_features = _require_width(self, "add_batchnorm")
     self.layers.append({"type": "batchnorm", "num_features": num_features, "epsilon": epsilon, "momentum": momentum,
-                        "running_mean": np.zeros(num_features, dtype=np.float64),
-                        "running_var": np.ones(num_features, dtype=np.float64),
-                        "gamma": np.ones(num_features, dtype=np.float64),
-                        "beta": np.zeros(num_features, dtype=np.float64)})
+                        "running_mean": np.zeros(num_features, dtype=backend.default_dtype()),
+                        "running_var": np.ones(num_features, dtype=backend.default_dtype()),
+                        "gamma": np.ones(num_features, dtype=backend.default_dtype()),
+                        "beta": np.zeros(num_features, dtype=backend.default_dtype())})
 
 def add_layernorm(self, normalized_shape=None, epsilon=1e-5):
     """Add Layer Normalization layer.
@@ -179,11 +181,11 @@ def add_layernorm(self, normalized_shape=None, epsilon=1e-5):
     if isinstance(normalized_shape, int):
         num_features = normalized_shape
     else:
-        num_features = int(np.prod(normalized_shape))
+        num_features = math.prod(normalized_shape)
     self.layers.append({"type": "layernorm", "normalized_shape": normalized_shape,
                         "epsilon": epsilon,
-                        "gamma": np.ones(num_features, dtype=np.float64),
-                        "beta": np.zeros(num_features, dtype=np.float64)})
+                        "gamma": np.ones(num_features, dtype=backend.default_dtype()),
+                        "beta": np.zeros(num_features, dtype=backend.default_dtype())})
 
 def add_dropout(self, rate=0.5):
     self.layers.append({"type": "dropout", "rate": rate})
