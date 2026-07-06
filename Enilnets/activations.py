@@ -1,4 +1,3 @@
-from .backend import np
 from . import backend
 from . import constants
 
@@ -10,6 +9,12 @@ def activate(name, x, alpha=None, sigmoid_clip=None):
     sigmoid_clip: overrides the sigmoid/softplus overflow-safe clip bound
         (default: constants.SIGMOID_CLIP).
     """
+    # Dispatches on x's own array module rather than the global active
+    # backend: most callers keep the two in sync automatically, but neat.py
+    # deliberately always computes on host NumPy regardless of the global
+    # GPU switch (see its module docstring), so activate() needs to work
+    # correctly on a plain NumPy `x` even while CuPy is globally active.
+    np = backend.array_module(x)
     clip = constants.SIGMOID_CLIP if sigmoid_clip is None else sigmoid_clip
     if name == "relu": return np.maximum(0, x)
     if name == "leakyrelu":
@@ -43,6 +48,7 @@ def derivative(name, x, alpha=None, sigmoid_clip=None, cached_output=None):
         recomputing exp/tanh for sigmoid/tanh/swish/mish/gelu. Ignored (and
         safe to omit) for activations whose derivative doesn't need it.
     """
+    np = backend.array_module(x)  # see activate()'s comment
     clip = constants.SIGMOID_CLIP if sigmoid_clip is None else sigmoid_clip
     if name == "relu": return (x > 0).astype(backend.default_dtype())
     if name == "leakyrelu":

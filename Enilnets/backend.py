@@ -114,3 +114,18 @@ def to_numpy(arr):
     if _cupy is not None and isinstance(arr, _cupy.ndarray):
         return arr.get()
     return _numpy.asarray(arr)
+
+
+def array_module(x):
+    """Return the array module (real NumPy or CuPy) that actually owns `x`,
+    regardless of which backend is currently globally active.
+
+    Shared elementwise code (activations.py) that's called with arrays from
+    a module that deliberately doesn't follow the global switch -- like
+    neat.py, which always computes on host NumPy even when GPU mode is on
+    elsewhere -- needs this instead of the `np` proxy: `np` would resolve to
+    CuPy while `x` is a plain NumPy array, and CuPy's ufuncs reject a bare
+    NumPy array argument."""
+    if _cupy is not None and isinstance(x, _cupy.ndarray):
+        return _cupy
+    return _numpy

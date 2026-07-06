@@ -11,15 +11,25 @@ representation with its own `forward()`.
 
 Note on GPU mode: `Genome.forward()` evaluates nodes one at a time in
 Python-level topological order, and mutation operators work on individual
-Python-scalar weights. This is not a batched, matmul-heavy workload, so
-enabling GPU mode (`Enilnets.use_gpu(True)`) is not expected to speed up
-NEAT and may be slower than CPU due to per-node kernel-launch overhead --
-GPU acceleration here primarily benefits `NeuralNet`'s batched
-Forward/Backward/optimizer path.
+Python-scalar weights. This is not a batched, matmul-heavy workload --
+per-genome topologies vary across the population (that's the whole point
+of NEAT), so there's no shared computational graph to batch evaluation
+across, even within one generation. Dispatching each tiny per-node op as
+its own GPU kernel is dramatically slower than doing the same tiny op on
+the CPU (measured: one XOR-solving evolution run went from ~5s on CPU to
+~85s under `Enilnets.use_gpu(True)`, a ~17x regression). So unlike every
+other module in this library, NEAT deliberately does NOT route through
+`Enilnets/backend.py`'s `np` proxy -- it always computes on host NumPy
+regardless of the process-wide GPU switch, and only follows
+`backend.default_dtype()` for float32/float64 (dtype choice is orthogonal
+to the device-dispatch cost that actually hurts here). GPU acceleration
+everywhere else in this library still benefits `NeuralNet`'s batched
+Forward/Backward/optimizer path -- this file is the one deliberate
+exception.
 """
 import statistics
+import numpy as np
 from collections import deque
-from .backend import np
 from . import backend
 from .activations import activate
 from . import constants
@@ -175,7 +185,11 @@ class Genome:
     def forward(self, x):
         """x: (n_inputs,) or (batch, n_inputs). Returns matching-rank output
         of shape (n_outputs,) or (batch, n_outputs)."""
-        x = np.asarray(x, dtype=backend.default_dtype())
+        # backend.to_numpy() first since x may be a CuPy array (e.g. built
+        # elsewhere in a GPU-mode pipeline) -- NEAT always computes on host
+        # NumPy internally (see module docstring), and real NumPy can't
+        # implicitly convert a CuPy array the way it can a plain list/array.
+        x = np.asarray(backend.to_numpy(x), dtype=backend.default_dtype())
         single = x.ndim == 1
         if single:
             x = x.reshape(1, -1)

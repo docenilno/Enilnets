@@ -163,11 +163,15 @@ backend is NumPy or CuPy. A few things to know:
   through host NumPy arrays regardless of which backend built the model,
   so a `.pkl`/`.json` file saved on GPU loads fine on a CPU-only machine
   and vice versa.
-- **GPU mode mainly benefits `NeuralNet`'s batched Forward/Backward/
-  optimizer path** (dense/conv/attention/RNN layers, large batches). NEAT
-  (`NEATPopulation`/`Genome`) evaluates one node at a time in a Python
-  loop and is not expected to benefit from GPU mode — it may even be
-  slower due to per-node kernel-launch overhead.
+- **GPU mode benefits `NeuralNet`'s batched Forward/Backward/optimizer
+  path** (dense/conv/attention/RNN layers, large batches). **NEAT
+  (`NEATPopulation`/`Genome`) always runs on host NumPy regardless of
+  `use_gpu()`** — it evaluates one node at a time in a Python loop, and
+  per-genome topologies vary across a population, so there's no shared
+  computational graph to batch even within one generation; dispatching
+  each tiny per-node op as its own GPU kernel measured ~17x *slower* than
+  plain CPU. `use_gpu(True)` still applies to any `NeuralNet` you build
+  elsewhere in the same process — this exception is specific to NEAT.
 - Check `Enilnets.gpu_available()` to see if CuPy + a CUDA device are both
   available before calling `use_gpu(True)`, if you want to fail gracefully
   instead of catching the `RuntimeError`.
