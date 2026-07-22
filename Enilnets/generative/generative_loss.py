@@ -1,6 +1,8 @@
-from ..backend import np
+from typing import Any, Optional
 
-def kl_divergence_gaussian(mu, logvar, reduction="mean", kl_weight=1.0):
+from ..core.backend import np
+
+def kl_divergence_gaussian(mu: Any, logvar: Any, reduction: str = "mean", kl_weight: float = 1.0) -> Any:
     """
     KL(q(z|x) || N(0, I)) for VAE.
     mu, logvar: arrays of shape (batch, latent_dim)
@@ -15,7 +17,7 @@ def kl_divergence_gaussian(mu, logvar, reduction="mean", kl_weight=1.0):
         return float(np.sum(kl))
     return kl
 
-def adversarial_loss_discriminator(real_logits, fake_logits, loss_type="bce"):
+def adversarial_loss_discriminator(real_logits: Any, fake_logits: Any, loss_type: str = "bce") -> float:
     """
     Discriminator loss.
     real_logits: D(real) output (before sigmoid if bce_logits)
@@ -35,7 +37,7 @@ def adversarial_loss_discriminator(real_logits, fake_logits, loss_type="bce"):
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
-def adversarial_loss_generator(fake_logits, loss_type="bce"):
+def adversarial_loss_generator(fake_logits: Any, loss_type: str = "bce") -> float:
     """
     Generator loss (trying to fool discriminator).
     """
@@ -48,7 +50,7 @@ def adversarial_loss_generator(fake_logits, loss_type="bce"):
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
-def diffusion_loss(predicted_noise, true_noise, reduction="mean"):
+def diffusion_loss(predicted_noise: Any, true_noise: Any, reduction: str = "mean") -> Any:
     """
     MSE between predicted and true noise for diffusion models.
     """
@@ -59,7 +61,7 @@ def diffusion_loss(predicted_noise, true_noise, reduction="mean"):
         return float(np.sum(loss))
     return loss
 
-def nll_loss(log_px, log_det_jacobian, reduction="mean"):
+def nll_loss(log_px: Any, log_det_jacobian: Any, reduction: str = "mean") -> Any:
     """
     Negative log-likelihood for normalizing flows.
     log_px: log p(z) where z is the transformed variable (base distribution)
@@ -72,7 +74,7 @@ def nll_loss(log_px, log_det_jacobian, reduction="mean"):
         return float(np.sum(nll))
     return nll
 
-def energy_loss(data_energy, sample_energy, margin=1.0):
+def energy_loss(data_energy: Any, sample_energy: Any, margin: float = 1.0) -> float:
     """
     Contrastive loss for energy-based models.
     Pushes down energy on data, pushes up on samples.
@@ -80,7 +82,7 @@ def energy_loss(data_energy, sample_energy, margin=1.0):
     loss = data_energy + np.maximum(0, margin - sample_energy)
     return float(np.mean(loss))
 
-def perceptual_loss(x, y, feature_extractor=None):
+def perceptual_loss(x: Any, y: Any, feature_extractor: Optional[Any] = None) -> float:
     """
     Perceptual loss using a feature extractor.
     If no feature_extractor provided, falls back to MSE.
@@ -91,7 +93,7 @@ def perceptual_loss(x, y, feature_extractor=None):
     feat_y = feature_extractor(y)
     return float(np.mean((feat_x - feat_y) ** 2))
 
-def vgg_loss(x, y, vgg_features=None):
+def vgg_loss(x: Any, y: Any, vgg_features: Optional[Any] = None) -> float:
     """VGG-based perceptual loss. `vgg_features` is any callable duck-typing
     to `feature_extractor(x) -> features` (e.g.
     `generative.pretrained.build_vgg16_feature_extractor(...).Forward`, with

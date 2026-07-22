@@ -9,9 +9,10 @@ from .text_generation import TextGenerator
 from .sampling import (
     reparameterize, langevin_dynamics, gaussian_sample,
     uniform_sample, gumbel_softmax_sample, random_mask,
-    top_p_sampling, top_k_sampling, compute_returns,
+    top_p_sampling, top_k_sampling, compute_returns, gae,
 )
 from .generative_loss import (
     kl_divergence_gaussian, adversarial_loss_discriminator,
     adversarial_loss_generator, diffusion_loss, nll_loss, energy_loss,
 )
+from .pretrained import build_vgg16_feature_extractor

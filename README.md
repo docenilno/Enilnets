@@ -12,7 +12,7 @@ one-line opt-in for anyone who has it — see
 
 - **GitHub:** https://github.com/docenilno/Enilnets
 - **License:** MIT
-- **Version:** 4.1.0
+- **Version:** 4.11.0
 - **Dependencies:** NumPy (required), CuPy (optional, for GPU mode)
 
 This README is a complete guide, not just a reference: it explains what
@@ -55,7 +55,11 @@ with [Choosing the right model for your task](#choosing-the-right-model-for-your
   - [Multi-head attention](#multi-head-attention)
   - [Cross-attention](#cross-attention)
   - [Positional encoding](#positional-encoding)
+  - [Vision blocks](#vision-blocks)
+  - [Multiplicative gating](#multiplicative-gating)
+  - [Mixture-of-Experts](#mixture-of-experts)
   - [Transformer block](#transformer-block)
+  - [KV-cache decoding](#kv-cache-decoding)
   - [Vision Transformer patch embedding](#vision-transformer-patch-embedding)
   - [RNN / LSTM / GRU](#rnn--lstm--gru)
   - [Bidirectional RNN/LSTM/GRU](#bidirectional-rnnlstmgru)
@@ -72,6 +76,8 @@ with [Choosing the right model for your task](#choosing-the-right-model-for-your
   - [Gradient accumulation](#gradient-accumulation)
   - [Mixed precision](#mixed-precision)
   - [Learning rate schedules](#learning-rate-schedules)
+  - [Finding a learning rate](#finding-a-learning-rate)
+  - [Weight averaging: EMA and SWA](#weight-averaging-ema-and-swa)
   - [Early stopping](#early-stopping)
   - [Callbacks](#callbacks)
   - [Accuracy / precision / recall / F1](#accuracy--precision--recall--f1)
@@ -93,14 +99,24 @@ with [Choosing the right model for your task](#choosing-the-right-model-for-your
 - [Visualization](#visualization)
 - [Evaluation utilities](#evaluation-utilities)
 - [Data utilities](#data-utilities)
-  - [General (`utils.py`)](#general-utilspy)
-  - [Text (`text_utils.py`)](#text-text_utilspy)
-  - [Images (`image_utils.py`)](#images-image_utilspy)
-  - [Audio (`audio_utils.py`)](#audio-audio_utilspy)
-  - [Cross-modal (`crossmodal_utils.py`)](#cross-modal-crossmodal_utilspy)
-  - [Dataset loaders (`datasets.py`)](#dataset-loaders-datasetspy)
+  - [General (`core/utils.py`)](#general-coreutilspy)
+- [Compression: pruning and quantization](#compression-pruning-and-quantization)
+  - [Pruning](#pruning)
+  - [Quantization](#quantization)
+  - [Quantization-aware training](#quantization-aware-training)
+  - [Differentiable audio front ends](#differentiable-audio-front-ends)
+  - [Audio transform pipeline](#audio-transform-pipeline)
+  - [Datasets and the DataLoader](#datasets-and-the-dataloader)
+  - [Transform pipelines (`preprocessing/`)](#transform-pipelines-preprocessing)
+  - [Text (`text/text_utils.py`)](#text-texttext_utilspy)
+  - [Images (`vision/image_utils.py`)](#images-visionimage_utilspy)
+  - [Audio (`audio/audio_utils.py`)](#audio-audioaudio_utilspy)
+  - [Cross-modal (`crossmodal/crossmodal_utils.py`)](#cross-modal-crossmodalcrossmodal_utilspy)
+  - [Dataset loaders (`datasets/loaders.py`)](#dataset-loaders-datasetsloaderspy)
 - [Model persistence](#model-persistence)
 - [Configuration system](#configuration-system)
+- [Autograd (`Enilnets.graph`)](#autograd-enilnetsgraph)
+- [Package layout](#package-layout)
 - [Full API index](#full-api-index)
 - [Known limitations](#known-limitations)
 - [Running the test suite](#running-the-test-suite)
@@ -117,7 +133,7 @@ pip install enilnets
 
 ```python
 import Enilnets
-print(Enilnets.__version__)  # "4.1.0"
+print(Enilnets.__version__)  # "4.11.0"
 ```
 
 ## GPU mode (optional)
@@ -150,6 +166,15 @@ Nothing else about the API changes — every `add_*` call, `Forward`,
 `TrainBatch`, `Save`/`Load`, etc. works exactly the same whether the active
 backend is NumPy or CuPy. A few things to know:
 
+- **If `use_gpu(True)` fails after a system update, reboot before
+  debugging anything else.** Upgrading the NVIDIA driver leaves the
+  *running* kernel module mismatched against the *newly installed*
+  userspace libraries until the machine restarts. In that window CUDA
+  reports no usable device — but `nvidia-smi` keeps working, which makes
+  it look like a library problem when it is not. `use_gpu()` probes the
+  CUDA driver API separately from the CUDA runtime and, when only the
+  former sees the GPU, says so explicitly instead of the misleading
+  "no GPU detected".
 - **`use_gpu()` is a single global switch**, not a per-model setting. Call
   it once before constructing any models; every model built afterward
   shares the active backend. Mixing backends across models in the same
@@ -471,14 +496,19 @@ Constructor:
 NeuralNet(learning_rate=0.001, optimizer="adam", l2_lambda=0.01, momentum=0.9,
           grad_clip_norm=0.0, use_mixed_precision=False,
           adam_beta1=0.9, adam_beta2=0.999, adam_epsilon=1e-8,
-          rmsprop_decay=0.9, rmsprop_epsilon=1e-8, adagrad_epsilon=1e-8)
+          rmsprop_decay=0.9, rmsprop_epsilon=1e-8, adagrad_epsilon=1e-8,
+          adadelta_rho=0.95, adadelta_epsilon=1e-6,
+          lion_beta1=0.9, lion_beta2=0.99,
+          adafactor_eps1=1e-30, adafactor_clip_threshold=1.0,
+          adafactor_decay_rate=-0.8)
 ```
 
 Every one of these is a plain attribute you can also read/write after
 construction (`model.learning_rate = 0.0001`, etc.) — there are no hidden
 private copies. `optimizer` must be one of `"sgd"`, `"rmsprop"`,
-`"adagrad"`, `"adam"`, `"adamw"` — any other string (including typos)
-raises `ValueError` at construction time. See [Optimizers](#optimizers) for
+`"adagrad"`, `"adadelta"`, `"adam"`, `"adamw"`, `"adamax"`, `"nadam"`,
+`"radam"`, `"lion"`, `"lamb"`, `"adafactor"` — any other string (including
+typos) raises `ValueError` at construction time. See [Optimizers](#optimizers) for
 what each one means and when to pick it.
 
 Other `NeuralNet` methods not tied to a specific layer or training call:
@@ -487,13 +517,13 @@ Other `NeuralNet` methods not tied to a specific layer or training call:
 |---|---|
 | `train()` / `eval()` | Set `self.training = True`/`False`; both return `self` (chainable). Layers that behave differently in train vs. eval (dropout, batchnorm) read `training` from the `Forward(training=...)` argument, not this flag directly — `train()`/`eval()` just set a convenience default you can check yourself. |
 | `set_lr(lr)` / `get_lr()` | Get/set `learning_rate`. |
-| `clip_gradients(max_norm)` | Global L2-norm clipping across `self.deltas` in place. No-op if `max_norm <= 0`. Called automatically by `TrainBatch` when `grad_clip_norm > 0`. |
+| `clip_gradients(max_norm)` | Clips the global L2 norm across every trainable parameter's actual gradient (computed via `compute_gradients()`) to `max_norm` -- standard `clip_grad_norm_`-style semantics, not just the norm of backprop deltas. No-op if `max_norm <= 0`. Called automatically by `TrainBatch` when `grad_clip_norm > 0`. |
 | `freeze(layer_idx=None)` / `unfreeze(layer_idx=None)` | Mark one layer (or all, if `None`) with `_frozen=True/False`; `apply_gradients`/`update` skip frozen layers entirely. Useful for transfer learning: freeze early layers, only train the head. |
 | `get_weights()` / `set_weights(weights)` | Snapshot/restore just the weight arrays (not optimizer state) as a list of dicts — lighter-weight than full `Save`/`Load` for e.g. checkpointing the best epoch. |
 | `copy()` | Deep-copies the entire model (layers, optimizer state, step counter, shape-inference bookkeeping, residual stack) into a new independent `NeuralNet`. |
 | `reset_optimizer_state()` | Clears `opt_state`, `t`, and gradient-accumulation buffers (e.g. before fine-tuning with a different optimizer). |
 | `check_nan_inf()` | Returns a list of human-readable strings describing any NaN/Inf found in weights/biases/gamma/beta/deltas — empty list means clean. Useful when training suddenly produces `nan` losses. |
-| `summary()` | Prints a layer-by-layer shape/parameter-count table to stdout. Returns `None` — for a value you can use in code, see `count_parameters(model)` in [Data utilities](#general-utilspy). |
+| `summary()` | Prints a layer-by-layer shape/parameter-count table to stdout. Returns `None` — for a value you can use in code, see `count_parameters(model)` in [Data utilities](#general-coreutilspy). |
 | `predict(x)` | A plain alias for `Forward(x, training=False, dropout_rate=0.0)` — same signature, same code path, just a familiar name. |
 
 ```python
@@ -835,7 +865,10 @@ model.add_lstm(128, 256)
 ```python
 add_multihead_attention(embed_dim=None, num_heads=4, dropout=0.0,
                         init_method="xavier_uniform", causal=False,
-                        positional_scheme="absolute")
+                        positional_scheme="absolute", num_kv_heads=None,
+                        window_size=None, attention_kernel="softmax",
+                        num_features=None, sparse_pattern=None,
+                        tiled_block_size=None)
 ```
 Standard scaled dot-product multi-head self-attention: every position in
 the sequence computes a weighted average of every *other* position,
@@ -862,23 +895,203 @@ layer, so the model can tell *where* in the sequence each token is):
 - `"alibi"` — a static per-head bias that penalizes attending to distant
   positions, added directly to the scores. No extra parameters.
 
+`num_kv_heads` selects **MHA / MQA / GQA** — how many Key/Value heads to
+project, shared across the `num_heads` Query heads:
+- `None` (default) → `num_heads` — ordinary **Multi-Head Attention**, every
+  query head gets its own K/V head. Byte-identical to the pre-existing
+  behavior.
+- `1` → **Multi-Query Attention**: all query heads read one shared K/V head.
+- any divisor of `num_heads` → **Grouped-Query Attention**: query heads are
+  split into `num_kv_heads` groups, each group sharing one K/V head.
+
+Query head *h* reads K/V group `h // (num_heads // num_kv_heads)` —
+group-major, the same convention as every reference implementation. This
+shrinks `Wk`/`Wv` and — the reason it actually matters — the
+[KV cache](#kv-cache-decoding) by `num_heads / num_kv_heads`, which is what
+bounds memory during long generations. Quality cost is small in practice,
+which is why essentially every modern decoder ships GQA.
+
+```python
+model.add_transformer_block(512, num_heads=8, causal=True, num_kv_heads=2)
+#  -> 8 query heads, 2 K/V heads: a 4x smaller KV cache
+```
+
+`window_size` turns on **sliding-window attention**: position *i* attends
+only where `|i - j| <= window_size` (`None`, the default, is unbounded).
+It composes with `causal`, which then leaves exactly the `window_size`
+preceding positions plus *i* itself — the Mistral-style decoder pattern.
+`window_size=0` degenerates to each position seeing only itself.
+
+Note what this does and does not buy you. On its own `window_size` is a
+*mask*: the S×S score matrix is still built and then masked, so training
+time and memory are unchanged (measured: 954 ms / 824 MB vs. 959 ms / 824 MB
+at B=4, S=1024, E=64, H=8). To turn the restriction into an actual saving,
+combine it with `tiled_block_size` below — same numbers, 143 MB. Where the
+window pays off unconditionally is *generation*, described next.
+
+The modelling trade is that a window only reaches further context indirectly,
+through stacked layers (a stack of *L* windowed layers has an effective receptive field of
+roughly `L * window_size`). During generation the effect is stronger still:
+[the KV cache](#kv-cache-decoding) **evicts** positions that have fallen out
+of the window rather than masking them, so decoding runs in constant memory
+per layer (`window_size + 1` entries) no matter how long the output gets.
+
+```python
+model.add_transformer_block(512, num_heads=8, causal=True, window_size=256)
+```
+
+Because `j == i` is always allowed, no query row is ever fully masked — the
+softmax stays well-defined for every setting.
+
+`attention_kernel` picks the attention *math* itself. Softmax attention has
+to build the full S×S score matrix, which is why cost grows quadratically
+with sequence length. The linearized kernels replace `softmax(q·k)` with a
+feature map φ where the score is just `φ(q)·φ(k)` — and because that is a
+plain inner product, the sum reassociates:
+
+```
+       softmax:  (Q K^T) V     ->  O(S^2 * d)
+    linearized:  φ(Q) (φ(K)^T V)  ->  O(S * d^2)      linear in S
+```
+
+- `"softmax"` (default) — exact, unchanged, byte-identical to before.
+- `"linear"` — φ(x) = elu(x) + 1 (Katharopoulos et al. 2020). A positive
+  similarity in its own right, *not* an approximation of softmax; models
+  trained with it simply learn a different (cheaper) attention.
+- `"performer"` — FAVOR+ random features (Choromanski et al. 2021):
+  φ(x) = exp(ω·x′ − ‖x′‖²/2)/√m with a fixed random ω drawn at build time.
+  This one *is* an unbiased estimator of softmax attention, so accuracy
+  improves with `num_features` (default `head_dim * 4`). ω is saved and
+  loaded with the model — it defines the layer's function, so redrawing it
+  would silently change the model.
+
+```python
+model.add_transformer_block(256, num_heads=8, causal=True,
+                            attention_kernel="performer", num_features=128)
+```
+
+Causal masking still works: the two global sums become *prefix* sums
+(`cumsum`), so position *i* only ever aggregates positions ≤ *i*.
+
+**During generation this is the strongest form of caching in the library.**
+Causal linear attention is a linear RNN — the entire history compresses into
+a running `Σ φ(k)⊗v` and `Σ φ(k)` — so
+[the KV cache](#kv-cache-decoding) keeps a **fixed-size** state that never
+grows with the generated length, rather than a K/V tensor per position.
+
+- **Limitations, and why:** these kernels never materialize a score matrix,
+  so anything defined *as* a score-matrix bias or mask has nowhere to live —
+  `positional_scheme="alibi"`, `window_size`, and attention `dropout` are
+  rejected with an explicit error rather than silently ignored. RoPE, MQA/GQA
+  and causal masking all work normally.
+- **Cost note:** the causal path materializes the prefix sums, which is
+  O(S · d_feat · head_dim) *memory*. That is the price of the readable
+  vectorized formulation here; for very long sequences with many Performer
+  features it can dominate, so prefer a modest `num_features`.
+
+`sparse_pattern` turns on **block-sparse attention**. The sequence is cut
+into blocks, and each *query block* attends to a small chosen set of *key
+blocks*. Crucially this is not a mask over a matrix that got built anyway:
+the selected blocks are physically **gathered**, so the S×S score matrix
+never exists and the cost is `O(S · blocks_per_query · block_size)`.
+
+```python
+model.add_transformer_block(256, num_heads=8, causal=True, sparse_pattern={
+    "block_size": 64,   # sequence is cut into blocks of this many positions
+    "local": 1,         # ...each block sees its 1 nearest neighbour block(s)
+    "global": 1,        # ...plus the first 1 block(s), visible to everyone
+    "random": 2,        # ...plus 2 random blocks, fixed at build time
+    "seed": 0,          # ...drawn from this seed, so the pattern round-trips
+})
+```
+The components form a union, which is the Longformer/BigBird recipe: local
+blocks capture nearby detail, global blocks give every position a shared
+channel to route information through, and random blocks keep the graph's
+diameter small so information can still cross the sequence in few layers. A
+block always sees itself, so no query is ever left with nothing to attend
+to. `local`/`global`/`random` all default such that a bare
+`{"block_size": n}` gives local-only attention.
+
+The pattern is a property of the model: the random choices come from `seed`
+and round-trip through save/load, so a reloaded model attends identically.
+For causal patterns the selection for block *i* is independent of how many
+blocks follow it, which is what lets [the KV cache](#kv-cache-decoding) step
+one token at a time and land on exactly the same numbers as a full forward
+pass.
+
+- **Use it for:** long sequences where you want *exact* softmax attention
+  over a restricted, structured neighbourhood — as opposed to a linearized
+  kernel, which approximates full attention instead of restricting it.
+- **Pros:** the gathered result is pinned against a dense masked-attention
+  oracle to 1e-12; gradients FD-checked standalone and end-to-end; works with
+  RoPE, ALiBi, MQA/GQA, causal or not; any sequence length (the tail is
+  padded internally and masked out, so `S` need not divide `block_size`).
+- **Cons/limitations, and why:** it cannot combine with `window_size` (both
+  restrict which keys a query sees — express the window as `local` blocks
+  instead) or with a linearized `attention_kernel` (there is no score matrix
+  to sparsify). Cached decoding keeps the **full** K/V history, since a
+  pattern may select any earlier block — the saving there is in per-step
+  compute, not memory.
+
+`tiled_block_size` opts into the **streaming ("Flash") softmax** path. Be
+clear about what that means here. FlashAttention is two things: a fused CUDA
+kernel, and the algorithm that makes fusing worth doing. A NumPy/CuPy
+library cannot write the kernel — but the algorithm is portable, and it is
+where the memory win actually comes from. Instead of building the whole
+S×S score matrix and then reducing it, this streams over key blocks while
+carrying an **online softmax** (a running max, running normalizer, and
+running output that are rescaled as each block arrives):
+
+```python
+model.add_transformer_block(512, num_heads=8, causal=True, tiled_block_size=128)
+```
+
+Peak memory per head drops from `O(S²)` to `O(S · block)`. The backward
+pass does the same thing in reverse — it recomputes each score block from
+Q/K/V rather than storing the attention weights, needing only the row sums
+`rowsum(dO ∘ O)` — so it is O(S · block) too.
+
+- **It is a backend, not a replacement.** `tiled_block_size=None` (the
+  default) leaves the original code path byte-for-byte untouched. When
+  enabled, the results are *the same numbers*: a test asserts equality with
+  the plain path to 1e-12 across every combination of causal, window,
+  positional scheme and block size, and asserts the gradients match the
+  plain path's as well as finite differences.
+- **Expect memory savings, not speed.** Without kernel fusion there is no
+  reduction in arithmetic. Measured on a causal layer at B=4, S=1024, E=64,
+  H=8: peak allocation falls from **824 MB to 143 MB** (5.8x) while the
+  forward pass runs 959 ms → 819 ms. It buys you sequence lengths that would
+  otherwise not fit.
+- **Limitations, and why:** incompatible with attention `dropout` (the
+  streaming path never holds the full attention matrix, so there is no
+  single object to apply one consistent mask to), and with `sparse_pattern`
+  or the linearized kernels (both already avoid building a score matrix —
+  there is nothing left to tile).
+
 - **Use it for:** text (via `TextGenerator` or manually), or any sequence
   task where long-range dependencies matter more than step-by-step
   recurrence. See [Sequences](#sequences-text-time-series-audio) above.
-- **Pros:** the mask, softmax, and backward pass (including both new
-  positional schemes) are all verified against finite-difference gradients;
+- **Pros:** the mask, softmax, and backward pass (including all positional
+  schemes and every `num_kv_heads` setting) are verified against
+  finite-difference gradients; MQA/GQA are additionally pinned against an
+  independent oracle (plain MHA with the K/V weights tiled out by hand),
+  and against the `graph` implementation under shared weights;
   supports arbitrary `num_heads`/`embed_dim` combinations.
 - **Cons:** this layer is self-attention only (Q/K/V all from the same
   input) — see `add_cross_attention` below for encoder-decoder-style
-  attention with a separate key/value source; `dropout` is currently
-  informational only (no separate attention-dropout layer is inserted —
-  use `add_dropout()` after the block instead).
+  attention with a separate key/value source.
+
+`dropout` applies standard post-softmax attention-weight dropout (dropped
+after the softmax, before the context matmul, at `training=True` only) —
+gradient-verified against finite differences with the dropout mask held
+fixed across perturbations.
 
 ### Cross-attention
 
 ```python
 add_cross_attention(kv_source_index, embed_dim=None, num_heads=4,
-                    dropout=0.0, init_method="xavier_uniform")
+                    dropout=0.0, init_method="xavier_uniform",
+                    num_kv_heads=None)
 ```
 Encoder-decoder-style attention: queries come from the normal sequential
 `x`; keys/values come from an *earlier* layer's output, named by
@@ -917,6 +1130,13 @@ out = model.Forward(X, training=True)                  # (4, 6, 10)
 - **Cons:** requires understanding the `"goto"` layer-index trick above to
   build a genuine two-branch architecture; no causal masking option.
 
+`dropout` works the same way as `add_multihead_attention`'s (post-softmax,
+`training=True` only), and `num_kv_heads` selects MHA/MQA/GQA exactly as it
+does there. There is deliberately no `window_size` here: a window is a
+constraint on the *distance between a query and a key*, which is only
+meaningful when both live in the same sequence — across two independently
+indexed sequences it would have no defined meaning.
+
 ### Positional encoding
 
 ```python
@@ -943,11 +1163,159 @@ model.add_transformer_block(64, num_heads=4)
   relative-position schemes, use `add_multihead_attention(positional_scheme=
   "rope"|"alibi")` instead of this layer.
 
+### Vision blocks
+
+```python
+add_se_block(channels=None, reduction=16, activation="relu")
+add_cbam_channel(channels=None, reduction=16, activation="relu")
+add_cbam_block(channels=None, reduction=16, kernel_size=7, activation="relu")
+add_convnext_block(channels=None, mlp_ratio=4.0, kernel_size=7, activation="gelu")
+add_efficientnet_block(channels=None, expand_ratio=4.0, kernel_size=3,
+                       reduction=16, activation="swish")
+add_spp(pool_sizes=(1, 2, 4))
+add_global_maxpool2d()
+add_channel_pool()
+```
+Named arrangements of primitives the library already has, so a caller
+writes one line instead of eight. `channels` is inferred from the previous
+conv/pool layer when left `None`.
+
+| Block | What it does |
+|---|---|
+| **SE** (Hu et al. 2018) | Squeeze `(B, C, H, W)` to `(B, C)` by global average pooling, run a bottleneck MLP (`C → C/reduction → C`, sigmoid), and rescale each channel by the result. Shape unchanged |
+| **CBAM channel** (Woo et al. 2018) | SE's idea with average **and** max pooling, summed before the sigmoid, through **one shared MLP** |
+| **CBAM block** | Channel attention, then spatial attention: pool across channels to `(B, 2, H, W)`, convolve to a one-channel map, gate every position by it |
+| **ConvNeXt** (Liu et al. 2022) | Large-kernel conv → LayerNorm → pointwise expand → activation → pointwise project, in a residual. A conv stack arranged like a transformer block |
+| **EfficientNet MBConv** (Tan & Le 2019) | Inverted residual: expand pointwise, convolve, squeeze-and-excite, project back. The skip connects the two *narrow* ends |
+| **SPP** | Max-pool to each grid size and concatenate, so the output length depends only on `pool_sizes` and channel count — **never on input resolution** |
+
+```python
+model.add_conv2d(3, 64, k=3, padding="same", input_size=(32, 32))
+model.add_se_block()             # channels inferred
+model.add_efficientnet_block()
+model.add_spp((1, 2, 4))         # -> fixed 64*21 width, any input size
+model.add_dense(None, 10, activation="softmax")
+```
+
+- **Pros:** every block is FD-gradient-checked at every parameter, with the
+  check additionally asserting no parameter group has an all-zero gradient —
+  a check that passes because everything is zero proves nothing. Shape
+  preservation, the SE gate being per-channel and in (0, 1), SPP's
+  resolution independence, and CBAM's MLP actually being shared are each
+  pinned separately.
+- **Cons/deviations, stated rather than hidden:**
+  - **CBAM channel attention is one fused layer**, not a composition. Its
+    MLP is shared between the two pooled paths, and a list of layer dicts
+    has no way to tie two `add_dense` layers' weights together.
+  - **ConvNeXt's depthwise conv is a full conv here.** `add_conv2d` is
+    dense; the block's *arrangement* is what it is about, but the parameter
+    count is higher than the paper's -- and so is the cost, measurably.
+
+**Measured cost** (forward+backward, B=8, 16 channels, 32x32, relative to
+the bare conv stack they wrap):
+
+| Block | vs baseline |
+|---|---|
+| `add_spp` | 1.02x |
+| `add_se_block` | 1.71x |
+| `add_cbam_block` | 2.37x |
+| `add_convnext_block` | 26x |
+| `add_efficientnet_block` | 63x |
+
+SE and CBAM are nearly free -- a pooling plus a tiny MLP. ConvNeXt and
+EfficientNet are not, because they *are* several full-resolution
+convolutions each; ConvNeXt additionally pays for the dense-conv
+substitution above, where a true depthwise conv would be `C x` cheaper.
+Reach for them when you want the architecture, not as a drop-in speedup.
+
+Two primitives exist mainly to serve these blocks but are useful alone:
+`add_global_maxpool2d()` (`(B,C,H,W) → (B,C,1,1)`) and `add_channel_pool()`
+(`(B,C,H,W) → (B,2,H,W)`, the per-position mean and max *across* channels).
+
+### Multiplicative gating
+
+```python
+model.add_residual_start()
+...                              # a branch producing a gate
+model.add_multiply_end()         # x = saved * gate
+```
+The counterpart to `add_residual_end()`'s addition. The gate is broadcast up
+to the saved tensor's rank by appending trailing singleton axes, so a
+channel gate `(B, C)` and a spatial gate `(B, 1, H, W)` both work against a
+`(B, C, H, W)` feature map. This is the primitive behind SE, CBAM and
+EfficientNet's SE stage.
+
+Closing either kind of block **restores the shape bookkeeping** to what it
+was at `add_residual_start()`, since the block's output has the saved
+tensor's shape however much the branch changed it in between — without
+that, the next auto-inferring layer would size itself from the gate branch.
+
+### Mixture-of-Experts
+
+```python
+add_moe(embed_dim=None, num_experts=4, hidden_dim=None, top_k=1,
+        activation="gelu", aux_loss_weight=0.01,
+        init_method="xavier_uniform")
+```
+A feed-forward layer that is really `num_experts` small MLPs plus a router.
+For each token the router scores every expert and only the **top-k actually
+run** — the tokens routed to an expert are gathered, pushed through it, and
+scattered back. So parameter count grows with `num_experts` while the
+compute per token stays fixed at `k` experts. That is the entire idea: more
+capacity without more work.
+
+Drop it in wherever a Transformer block's MLP would go:
+
+```python
+model.add_residual_start()
+model.add_layernorm(256)
+model.add_moe(256, num_experts=8, top_k=2)   # 8x the MLP capacity, 2x the work
+model.add_residual_end()
+```
+
+**Gates are the raw router softmax probabilities**, not renormalized across
+the chosen k. This matters: renormalizing would make every gate exactly 1.0
+at `top_k=1` and cut the router's gradient completely, leaving routing
+untrainable. Keeping the raw probability is what lets the router learn.
+
+**Load balancing.** Left alone, routers collapse: a few experts win early,
+get all the gradient, and the rest never train. `aux_loss_weight` adds the
+Switch Transformer auxiliary loss `num_experts · Σₑ fₑ·Pₑ` — `fₑ` is the
+fraction of tokens dispatched to expert *e*, `Pₑ` its mean router
+probability. It equals `1.0` for a perfectly balanced router and
+`num_experts` for a fully collapsed one, so minimizing it spreads the load.
+Only `Pₑ` carries gradient (`fₑ` is a hard count).
+
+The auxiliary loss is **always measured** and readable via
+`model.moe_aux_loss()` (summed over every MoE layer, from the last
+`Forward`). Its *gradient* is folded into `Backward()` automatically, scaled
+by `aux_loss_weight`. It is deliberately not added to the number
+`ComputeLoss` reports, so your training curve stays a curve of the task
+loss — watch the two separately.
+
+- **Use it for:** scaling a model's capacity when compute, not memory, is
+  your constraint.
+- **Pros:** genuine conditional compute — a test asserts that perturbing an
+  *unselected* expert's weights changes nothing; the whole layer is
+  FD-checked (including the auxiliary loss, against `task + α·aux`); the
+  forward is pinned against a dense mixture oracle that runs every expert on
+  every token; the balancing loss is verified both by formula and
+  behaviorally (training with it on ends measurably more balanced).
+- **Cons/notes:** there is **no expert-capacity cap and no token dropping** —
+  a real gather has no fixed-size buffer to overflow, so this is strictly
+  better behaved than the capacity-factor scheme, but it also means a badly
+  balanced router costs uneven time rather than silently dropping tokens.
+  The per-expert loop is Python (over experts, not tokens), so very large
+  `num_experts` adds interpreter overhead.
+
 ### Transformer block
 
 ```python
 add_transformer_block(embed_dim=None, num_heads=4, mlp_ratio=4.0, dropout=0.0,
-                      activation="swish", causal=False, positional_scheme="absolute")
+                      activation="swish", causal=False, positional_scheme="absolute",
+                      num_kv_heads=None, window_size=None,
+                      attention_kernel="softmax", num_features=None,
+                      sparse_pattern=None, tiled_block_size=None)
 ```
 A full pre-norm Transformer block in one call: attention (with its own
 residual connection) followed by a small MLP (with its own residual
@@ -972,6 +1340,56 @@ model.add_dense(128, vocab_size, activation="softmax")
 - **Cons:** pre-norm only (no post-norm option); no built-in cross-attention
   variant (build encoder-decoder architectures via `add_cross_attention`
   directly, as shown above).
+
+### KV-cache decoding
+
+```python
+from Enilnets import KVCache, cached_forward_step
+
+cache = KVCache()
+logits = cached_forward_step(model, prompt_ids, cache)   # prime, (B, S, V)
+logits = cached_forward_step(model, next_ids, cache)     # step,  (B, 1, V)
+```
+Incremental (autoregressive) decoding for any **causal** attention stack:
+instead of re-running the whole growing context at every step — O(n²) over
+a generation — each call projects only the *new* tokens and attends over
+the keys/values cached from all previous ones, which is O(n) overall.
+
+`token_ids` is an integer array `(batch, n_new)` (a bare `(n_new,)` is
+treated as batch 1). Multi-token steps are allowed and get the usual causal
+mask *among themselves*, so a whole prompt can prime in one call and the
+result is bit-for-bit the same as a full `Forward()` over the same tokens
+(pinned by tests for all three positional schemes). `cache.position` tracks
+the absolute position of the next token; pass `advance_position=False` to
+manage it yourself. Create one `KVCache` per generation stream and discard
+it to start over.
+
+Supported layer types: `embedding`, `positional_encoding` (learned and
+sinusoidal), `layernorm`, `dense`, `dropout` (inference no-op),
+`residual_save`/`residual_add`, `moe`, and **causal** `multihead_attention` in all
+three positional schemes (`absolute`, `rope`, `alibi`) and any
+`num_kv_heads` (MHA/MQA/GQA — the cache stores the *unexpanded* K/V heads,
+so GQA's memory saving is real here, not just in the weights) and any
+`window_size` (out-of-window entries are **evicted** from the cache, so a
+windowed layer decodes in constant memory), and any `attention_kernel` —
+linear/Performer layers keep a fixed-size recurrent state in `cache.linear`
+instead of a K/V tensor, so they decode in constant memory at *any* length —
+and any `sparse_pattern`, where each step scores only the keys inside its
+own selected blocks — i.e. everything `add_transformer_block(causal=True)`
+builds. Anything else raises a clear
+error naming the offending layer.
+
+- **Use it for:** any hand-built GPT-style stack you want to sample from;
+  `TextGenerator.generate()` uses exactly this internally.
+- **Pros:** batched and multi-token (unlike a typical one-token-at-a-time
+  cache); handles RoPE by caching already-rotated keys and ALiBi by biasing
+  at absolute positions, so it stays exact; refuses unsupported
+  architectures loudly rather than silently returning wrong numbers.
+- **Cons:** inference only (no gradients — it bypasses `Forward`'s bookkeeping
+  entirely); requires `causal=True` attention, since a non-causal layer's
+  output at earlier positions changes when later tokens arrive, which a cache
+  fundamentally cannot represent; no support for arbitrary layer types
+  (conv, RNN, pooling) — use a full `Forward()` for those.
 
 ### Vision Transformer patch embedding
 
@@ -1038,6 +1456,15 @@ model.add_lstm(64, 128, return_sequences=True)
 model.add_lstm(128, 128, return_sequences=True)
 model.add_lstm(128, 64, return_sequences=False)  # final layer summarizes
 ```
+
+**Stateful mode** (`stateful=True` on `add_rnn`/`add_lstm`/`add_gru`):
+the layer retains its final hidden (and cell) state across `Forward`
+calls, so a long stream can be fed in chunks with identical results to
+one full pass — call `model.reset_rnn_state()` to start a new stream.
+Carried state is treated as a constant for BPTT (standard truncated-BPTT
+semantics), never saved into `Save()` files (a loaded model starts
+fresh), and a batch-size change mid-stream raises a clear error. Default
+`stateful=False` reproduces the old always-from-zero behavior exactly.
 
 - **Pros:** real BPTT (not truncated/approximated), all three variants
   available, auto-shape-inference works the same as every other layer.
@@ -1308,10 +1735,32 @@ speed of convergence, and how much per-parameter adaptation they do.
 | `"adagrad"` | `adagrad_epsilon` | Sparse gradients (e.g. embeddings with a huge vocabulary) | Rarely-updated features get comparatively larger steps | Effective learning rate only shrinks over time — can stall on long runs |
 | `"adam"` | `adam_beta1`, `adam_beta2`, `adam_epsilon` | The default choice for almost everything | Adaptive per-parameter rates + momentum + bias correction | L2 weight decay is coupled into the gradient (AdamW fixes this) |
 | `"adamw"` | same as Adam | You're using `l2_lambda` and want the modern, decoupled-decay behavior | Decoupled weight decay, the modern recommendation over Adam+L2 | Decay still happens every step regardless of gradient |
+| `"adadelta"` | `adadelta_rho`, `adadelta_epsilon` | You don't want to tune a learning rate at all | Step size is a ratio of RMS(past updates) to RMS(past gradients), so it's unit-consistent and needs no LR — leave `learning_rate=1.0` | Can be slow late in training as the accumulators equilibrate |
+| `"adamax"` | same as Adam | Gradients are occasionally huge and you want the denominator to react to the spike rather than average it away | Uses the L-∞ norm of past gradients, which needs no bias correction of its own | Less well studied than Adam; the max decays only geometrically after a spike |
+| `"nadam"` | same as Adam | You'd use Adam but want momentum's lookahead | Nesterov-accelerated Adam — applies the momentum step to the *current* gradient | Marginal gains over Adam on many problems |
+| `"radam"` | same as Adam | Training is unstable in the first few hundred steps and you'd otherwise add an LR warmup | Rectified Adam: switches the adaptive denominator *off* until the second-moment estimate is statistically trustworthy, so no warmup schedule is needed | Deliberately slower at the very start; that's the mechanism, not a defect |
+| `"lion"` | `lion_beta1`, `lion_beta2` | Optimizer memory matters, or you want a very cheap step | Update is the *sign* of an interpolated momentum, so every weight moves by exactly ±`lr`; keeps **one** accumulator instead of Adam's two | Needs a noticeably smaller `learning_rate` than Adam (roughly 3-10×); the fixed step size is unusual to tune |
+| `"lamb"` | same as Adam | Very large batches, where a single global LR suits no layer | Rescales each parameter tensor's update by the layer-wise trust ratio ‖w‖/‖r‖, so every tensor moves proportionally to its own norm | The trust ratio is clamped at 10 for stability; on small batches it mostly just reproduces Adam |
+| `"adafactor"` | `adafactor_eps1`, `adafactor_clip_threshold`, `adafactor_decay_rate` | The model is big enough that optimizer state is a real memory cost | Stores the second moment **factored** as a row vector plus a column vector — O(R+C) instead of O(R×C) — and clips each update's RMS | The factorization is an approximation; 1-D parameters can't be factored and keep a full accumulator |
 
 `optimizer_type` is validated at `NeuralNet(...)` construction time — any
-string other than the five above (including typos) raises `ValueError`
-immediately.
+string other than the twelve above (including typos) raises `ValueError`
+immediately, and the message lists the valid names.
+
+**Weight decay is decoupled** (applied to the weights, not folded into the
+gradient) for `"adamw"`, `"lion"` and `"lamb"`, and coupled for everything
+else — which is the standard behavior for each.
+
+**Optimizer state is allocated per rule**, not one-size-fits-all, so the
+memory characteristics are real rather than nominal. Measured on a
+512→512→512→10 MLP (~530k parameters), floats of optimizer state after one
+step:
+
+| | state | vs Adam |
+|---|---|---|
+| `sgd`, `rmsprop`, `adagrad`, `lion` | 530,442 | 0.5× |
+| `adam`, `adamw`, `adamax`, `nadam`, `radam`, `lamb`, `adadelta` | 1,060,884 | 1.0× |
+| `adafactor` | **3,604** | **0.003×** |
 
 ```python
 model = NeuralNet(optimizer="adamw", learning_rate=0.001, l2_lambda=0.01)
@@ -1320,8 +1769,9 @@ model = NeuralNet(optimizer="adamw", learning_rate=0.001, l2_lambda=0.01)
 Weight-decay eligibility is hardcoded per layer type: `dense`/`sparse`/
 `conv2d`/`embedding` decay `weights` only (never bias); `multihead_attention`
 decays `Wq`/`Wk`/`Wv`/`Wo` (never the biases); `rnn`/`lstm`/`gru` decay
-`Wx`/`Wh` (never `b`/`bx`/`bh`); batchnorm/layernorm `gamma`/`beta` are never
-decayed.
+`Wx`/`Wh` (never `b`/`bx`/`bh`); `moe` decays the expert stacks `W1`/`W2` and
+the router `Wr` (never `b1`/`b2`/`br`); batchnorm/layernorm `gamma`/`beta`
+are never decayed.
 
 Gradient clipping is automatic whenever `grad_clip_norm > 0`:
 ```python
@@ -1426,6 +1876,13 @@ training — typically starting higher (fast early progress) and decaying
 | `"exponential"` | `decay=0.95` | Multiply LR by `decay` every epoch |
 | `"cosine"` | `max_epochs=100` | Smooth cosine decay to 0 over `max_epochs` |
 | `"warmup_cosine"` | `max_epochs=100`, `warmup_epochs=5` | Linear ramp-up, then cosine decay — common for transformers |
+| `"polynomial"` | `max_epochs=100`, `power=1.0`, `end_lr=0.0` | Decay from `initial_lr` to `end_lr` as `(1 - e/E)**power`. `power=1` is a straight line; higher powers stay high longer, then fall off |
+| `"cyclic"` | `base_lr`, `max_lr`, `step_size=10`, `policy="triangular"`, `gamma=0.999` | Cyclical LR (Smith 2017): sweep `base_lr ↔ max_lr` every `2*step_size` epochs. `"triangular2"` halves the amplitude each cycle; `"exp_range"` scales it by `gamma**epoch` |
+| `"one_cycle"` | `max_lr`, `max_epochs=100`, `pct_start=0.3`, `div_factor=25`, `final_div_factor=1e4` | The 1cycle policy: cosine-anneal up to `max_lr` over the first `pct_start` of the run, then all the way down to `max_lr/final_div_factor`. One cycle, no repeats |
+| `"cosine_warm_restarts"` | `T_0=10`, `T_mult=1`, `eta_min=0.0` | SGDR: cosine-anneal over `T_0` epochs, jump back to full LR, and lengthen each successive cycle by `T_mult` |
+| `"lambda"` | `lr_lambda=fn` | Whatever you want: `fn(epoch)` returns a multiplier on `initial_lr` |
+| `"swa"` | `swa_start=0`, `swa_lr=0.05`, `anneal_epochs=5` | Stochastic Weight Averaging's schedule: train normally until `swa_start`, linearly anneal to `swa_lr`, then **hold** it — see [Weight averaging](#weight-averaging-ema-and-swa) |
+| `"sequential"` | `schedulers=[...]`, `milestones=[...]` | Chain schedules back to back. `milestones` are the epochs where each next schedule takes over; there must be exactly one fewer milestone than scheduler |
 | `"plateau"` | `factor=0.5`, `patience=10`, `min_delta=0.0`, `metric_mode="min"` | Real `ReduceLROnPlateau`: cuts the LR by `factor` once `patience` epochs pass with no improvement in the monitored metric. Call `scheduler.step(epoch, metric=...)`; `Train(..., scheduler=...)` does this automatically. |
 
 ```python
@@ -1434,6 +1891,97 @@ scheduler = LRScheduler(initial_lr=0.001, mode="cosine", max_epochs=50)
 history = model.Train(X_train, Y_train, epochs=50, batch_size=32, scheduler=scheduler)
 print(history["lr"])  # the actual LR used each epoch
 ```
+
+`"sequential"` restarts the epoch counter for each schedule it hands over
+to, so a chained cosine anneals across its own span instead of resuming
+somewhere mid-curve — which is almost always what you meant:
+
+```python
+warmup = LRScheduler(1e-3, mode="lambda", lr_lambda=lambda e: (e + 1) / 5)
+anneal = LRScheduler(1e-3, mode="cosine", max_epochs=45)
+scheduler = LRScheduler(1e-3, mode="sequential",
+                        schedulers=[warmup, anneal], milestones=[5])
+```
+
+Every schedule is clamped past its horizon rather than allowed to run
+negative, and none ever returns a value outside its own floor/peak — both
+pinned by tests across 60 epochs of every mode.
+
+### Finding a learning rate
+
+```python
+from Enilnets import find_learning_rate
+report = find_learning_rate(model, X_train, Y_train,
+                            start_lr=1e-7, end_lr=1.0, num_iter=100)
+print(report["suggested_lr"])
+```
+The LR range test (Smith 2015): ramp the learning rate exponentially across
+a hundred-odd batches, record the loss, and read the usable range off the
+curve instead of guessing. Returns `{"lrs", "losses", "raw_losses",
+"suggested_lr"}` — `losses` is EMA-smoothed and bias-corrected, and
+`suggested_lr` is the rate at the **steepest downward slope**, which is the
+conventional reading (the loss *minimum* already sits in the unstable
+region, so it is too high to train at).
+
+It stops early once the smoothed loss exceeds `diverge_factor`× its best,
+since past that point the curve carries no information.
+
+**This is a probe, not training.** Weights, optimizer state, step counter,
+learning rate and any in-progress gradient accumulation are all snapshotted
+and restored before it returns — pinned by a test that trains first, so
+there is real optimizer state to disturb, then asserts every array is
+unchanged afterwards.
+
+### Weight averaging: EMA and SWA
+
+Both keep a second set of weights alongside the ones being trained, on the
+observation that an average of points along the trajectory generalizes
+better than the final point. They differ in how they weight the history.
+
+```python
+from Enilnets import EMA
+
+ema = EMA(model, decay=0.999)
+for epoch in range(epochs):
+    for xb, yb in batches:
+        model.TrainBatch(xb, yb)
+        ema.update()                 # after every optimizer step
+
+with ema:                            # swap the averaged weights in
+    val_loss = model.ComputeLoss(model.Forward(X_val, training=False), Y_val)
+# live weights are back, even if the block raised
+```
+`EMA` decays the history geometrically. `warmup=True` (the default) ramps
+the effective decay as `min(decay, (1+n)/(10+n))`, so the average is not
+anchored to the random initialization for the first few hundred steps.
+`apply()`/`restore()` are the explicit form of the context manager, and
+`copy_to(other_model)` writes the average elsewhere.
+
+```python
+from Enilnets import SWA
+
+swa = SWA(model, swa_start=75, swa_lr=0.05, anneal_epochs=5)
+history = model.Train(X, Y, epochs=100, scheduler=swa.scheduler(initial_lr=0.1),
+                      callbacks=[...])
+# ...calling swa.update() once per epoch from swa_start onwards, then:
+swa.finalize()          # install the average
+swa.update_bn(X_train)  # only needed if the model has batchnorm layers
+```
+`SWA` averages epoch-end snapshots with **equal** weight — an unweighted
+running mean — which is why it wants a flat, high learning rate: the
+snapshots have to be meaningfully different points around the basin.
+`swa.scheduler(initial_lr)` produces exactly that schedule (`mode="swa"`):
+train normally until `swa_start`, linearly anneal to `swa_lr` over
+`anneal_epochs`, then hold it there.
+
+- **`update_bn` is not optional if you use batchnorm.** The stored running
+  mean/variance were accumulated under the individual snapshots' weights and
+  do not describe the averaged model's activations at all. `update_bn`
+  resets them and streams the data through once with `momentum = 1/(i+1)`,
+  which makes the running update an exact cumulative average. It is a no-op
+  on models without batchnorm.
+- Both expose `state_dict()`/`load_state_dict()`, so the averaged weights
+  round-trip through `model.Save(..., extra_state={"ema": ema.state_dict()})`.
 
 ### Early stopping
 
@@ -1574,13 +2122,42 @@ slower, but often higher-quality than sampling for short, precise outputs.
 - `generate(..., use_cache=True)` (default) decodes with a KV-cache: only
   the new token's query is computed each step, past keys/values cached and
   reused — much faster than recomputing the whole sequence at every step.
-  **Limitation:** only understands the exact architecture `TextGenerator`
-  builds — if you've hand-modified `gen.network`, pass `use_cache=False`.
-- `generate_beam(...)` does **not** use the KV-cache — slower than
-  `generate()` per token, as expected for exact beam search.
+  It is the general `Enilnets.cached_forward_step` mechanism (see
+  [KV-cache decoding](#kv-cache-decoding)), so the whole prompt primes in a
+  single batched step. **Limitation:** the supported layer types are the
+  ones listed there — if you've hand-modified `gen.network` with something
+  else, pass `use_cache=False`.
+- `generate_beam(..., top_k=None, use_cache=True)` restricts how many
+  tokens each beam may expand to per step (`top_k`, default `beam_width`)
+  and decodes incrementally, reordering the KV cache by parent beam after
+  each prune. `use_cache` changes nothing about the result — a test asserts
+  the cached and uncached paths return identical text across beam widths,
+  top-k values and length penalties. Measured on 12 new tokens: 1.6x faster
+  at `beam_width=1`, 2.7x at 4, 3.2x at 8 -- the gap widens with beam width,
+  since every beam was previously re-running the full context.
+- `generate_batch(prompts, ...)` generates for several prompts at once.
+  Prompts are grouped by **token length** rather than padded to a common
+  width: `nn/` attention has no padding mask, so pad tokens would be
+  attended to, and left-padding would additionally shift every real token's
+  absolute position. Grouping keeps the batching benefit while staying
+  *exactly* equal to generating each prompt on its own, which is pinned by
+  a test. Measured 4.3x faster than a Python loop over 8 same-length
+  prompts.
 - `perplexity(text)` (a standard language-model quality metric — lower is
   better, roughly "how surprised was the model by this text") requires at
   least 2 tokens after tokenization.
+
+- **Pros:** ready-made GPT-style transformer — no manual layer wiring
+  needed; greedy/temperature/top-p/top-k sampling and exact beam search all
+  built in; KV-cache makes `generate()` linear instead of quadratic in
+  output length; `perplexity()` gives a standard quantitative quality check
+  without a separate eval script.
+- **Cons:** `use_cache=True` (the default) only understands the exact
+  architecture this class builds — hand-modifying `gen.network` requires
+  `use_cache=False`; there's no dedicated whole-model save/load — persist
+  training progress via `gen.network.get_weights()`/`set_weights()`
+  (alongside `tokenizer.save()`/`load()` for the vocabulary) rather than a
+  single call.
 
 ```python
 Tokenizer(vocab_size=256, level="char", oov_token="<OOV>", pad_token="<PAD>",
@@ -1594,6 +2171,37 @@ tokenizer.save(path) / tokenizer.load(path)                   # JSON round-trip
 (unbounded, ignores `vocab_size`); `level="word"` truncates to the
 `vocab_size - 4` most common words. Unknown tokens at encode time map to
 `oov_token`.
+
+### Subword tokenizers (BPE)
+
+```python
+from Enilnets import BPETokenizer
+
+tok = BPETokenizer(vocab_size=8000, level="word").fit(corpus)
+ids = tok.encode("the quick brown fox")
+text = tok.decode(ids)                      # exact round trip
+tok.save("bpe.json"); BPETokenizer().load("bpe.json")
+```
+Byte Pair Encoding trained from scratch, with the same
+`fit`/`encode`/`decode`/`save`/`load` interface as `Tokenizer` — so it
+drops straight into `TextGenerator`.
+
+A character tokenizer has a tiny vocabulary but long sequences; a word
+tokenizer has short sequences but a huge vocabulary and no way to spell an
+unseen word. BPE learns the tradeoff, merging the most frequent adjacent
+pair repeatedly until it hits the vocabulary budget.
+
+- `level="word"` (default) splits on whitespace first, so a merge never
+  spans a word boundary. Unseen characters become `<OOV>`.
+- `level="byte"` works on raw UTF-8 bytes and seeds the alphabet with **all
+  256 byte values**, so there is genuinely no out-of-vocabulary case — any
+  input at all encodes and round-trips, including scripts absent from the
+  training corpus. Its `vocab_size` floor is therefore 260 (256 bytes plus
+  the four special tokens), which is enforced.
+
+Encoding always applies the **earliest-learned** applicable merge, so one
+merge table yields exactly one segmentation; whitespace is carried in a
+`▁` marker rather than discarded, which is what makes decoding exact.
 
 ## Generative models
 
@@ -1641,8 +2249,11 @@ midpoints = vae.interpolate(x1, x2, n_steps=10)
 ```
 Methods: `encode(x) -> (mu, logvar)`, `decode(z)`, `forward(x) -> (recon, mu,
 logvar, z)`, `loss(x, ..., kl_weight=1.0)`, `train_step(x, kl_weight=1.0)`,
-`Train(...)`, `generate(n_samples=1)`, `reconstruct(x)`,
-`interpolate(x1, x2, n_steps=10)`.
+`Train(..., callbacks=None)`, `generate(n_samples=1)` (also available as
+`sample(n_samples=1)`, matching the other generative models' naming),
+`reconstruct(x)`, `interpolate(x1, x2, n_steps=10)`. `Train` accepts the
+same `callbacks=[...]` convention as `NeuralNet.Train`/`TextGenerator.Train`
+(see [Callbacks](#callbacks)) — `on_batch_end`/`on_epoch_end`/`on_train_end`.
 
 - **Pros:** smooth, well-structured latent space (good for interpolation,
   downstream feature extraction); stable to train, no adversarial dynamics.
@@ -1677,7 +2288,10 @@ variant is generally the most stable to train). Generator output is
 targets. `mode_collapse_score()` is a quick diagnostic for "mode
 collapse" — a common GAN failure mode where the generator finds a small
 number of outputs that reliably fool the discriminator and stops
-exploring, producing low-diversity samples.
+exploring, producing low-diversity samples. `Train(..., callbacks=None)`
+accepts the same convention as `NeuralNet.Train` (see
+[Callbacks](#callbacks)), except `on_batch_end`/`on_epoch_end`'s `logs`
+carry both `d_loss` and `g_loss` (GAN tracks two losses, not one).
 
 - **Pros:** sharpest samples among the generative models here; Wasserstein
   variant is more stable than vanilla BCE GAN; `mode_collapse_score()`
@@ -1714,7 +2328,9 @@ partial = diffusion.denoise(x_noisy, t_start=500, t_end=0)
 (the latter requires `data_shape=(C, H, W)`). `use_ema=True` maintains a
 separate exponential-moving-average copy of denoiser weights, typically
 producing noticeably better samples than raw training weights (automatic,
-swapped in during `sample()`/`denoise()`).
+swapped in during `sample()`/`denoise()`). `Train(..., callbacks=None)`
+accepts the same convention as `NeuralNet.Train` (see
+[Callbacks](#callbacks)).
 
 - **Pros:** DDPM-style training (the well-studied, stable denoising
   objective); EMA weights typically produce noticeably better samples;
@@ -1764,7 +2380,8 @@ x_reconstructed = flow.inverse(z)
 ```
 Each of `n_coupling` layers alternates which half of the input dims gets
 transformed. `log_prob(x)`/`loss(x)` (negative log-likelihood) are exact,
-not a variational bound like a VAE's.
+not a variational bound like a VAE's. `Train(..., callbacks=None)` accepts
+the same convention as `NeuralNet.Train` (see [Callbacks](#callbacks)).
 
 - **Pros:** exact likelihood computation and exact invertibility
   (`forward`/`inverse` are true inverses of each other) — useful when you
@@ -1796,7 +2413,8 @@ score = ebm.score(x)  # gradient of energy w.r.t. x
 Trained via (persistent) contrastive divergence with Langevin dynamics
 (gradient-based sampling with added noise) for negative sampling.
 `persistent_cd=True` maintains a buffer of negative samples carried across
-calls.
+calls. `Train(..., callbacks=None)` accepts the same convention as
+`NeuralNet.Train` (see [Callbacks](#callbacks)).
 
 - **Pros:** conceptually the most flexible generative model here;
   `score(x)` directly gives you a gradient field useful for other
@@ -1822,10 +2440,15 @@ a `num_classes`-way categorical (pixel-value-style, e.g. 0-255);
 ```python
 ar = AutoregressiveModel(data_dim=784, discrete=True, num_classes=256)
 ar.Train(X_train, epochs=30, batch_size=64)
-samples = ar.generate(n_samples=16)
+samples = ar.generate(n_samples=16)  # also available as ar.sample(n_samples=16)
 completed = ar.complete(partial_x, n_dims=400)
 print("log-likelihood:", ar.log_prob(X_val).mean())
 ```
+`discrete=True` inputs to `loss`/`train_step`/`log_prob` must be scaled to
+`[0, 1]` (rescaled internally to `0..num_classes-1`) — passing raw
+un-normalized data (e.g. actual 0-255 pixel values instead of pixel/255)
+raises a clear `ValueError` rather than silently training on clipped
+garbage.
 
 - **Pros:** exact likelihood (like normalizing flows); `complete()` gives a
   natural inpainting/completion API (fill in missing dimensions given
@@ -1857,14 +2480,19 @@ out = unet.forward(x, t)
 
 unet.Train(X_train, epochs=50, batch_size=32)   # full DDPM training, like DiffusionModel.Train
 samples = unet.sample(n_samples=16, shape=(1, 28, 28))
+
+# DDIM fast sampling (same idea as DiffusionModel.sample_ddim above, ported
+# onto UNetDenoiser's own noise schedule): far fewer forward passes than
+# the full time_steps ancestral sample() above.
+fast_samples = unet.sample_ddim(n_samples=16, shape=(1, 28, 28), n_steps=50, eta=0.0)
 ```
 Every convolution is `k=3, padding="same"` (real 3x3 convs, not 1x1),
 with skip connections at matching resolutions. Fully independently
 trainable — `backward(grad_output)` backprops through every subnetwork in
-exact reverse of `forward()`'s order, and `train_step`/`Train`/`sample`
-give it its own self-contained DDPM training loop (a linear-only noise
-schedule — no cosine option, no EMA; use `DiffusionModel` if you need
-those).
+exact reverse of `forward()`'s order, and `train_step`/`Train`/`sample`/
+`sample_ddim` give it its own self-contained DDPM training loop (a
+linear-only noise schedule — no cosine option, no EMA; use `DiffusionModel`
+if you need those).
 
 - **Pros:** encoder-decoder with skip connections at matching resolutions,
   real 3x3 same-padding convs, independently trainable (`get_params()`
@@ -2116,15 +2744,26 @@ for epoch in range(epochs):
     if epoch % 10 == 0:
         model.plot(sample_input=X_batch[:1], filename=f"epoch_{epoch}.svg")
 ```
-Dense/sparse/RNN/LSTM/GRU layers become columns of circular nodes with
-real weighted edges (blue = positive, red = negative); other layer types
-(conv2d, attention, pooling, embedding, ...) render as labeled blocks in
-between, since they don't reduce to a single weight matrix connecting two
-node columns. Batchnorm/layernorm/dropout are transparent to the diagram
-(edges drawn straight through them).
+Dense/sparse/RNN/LSTM/GRU/conv2d/conv1d/attention layers all become
+columns of circular nodes with real weighted edges (blue = positive, red
+= negative, thickness/opacity = relative magnitude) — conv edges
+aggregate the spatial kernel into a per-channel-pair magnitude, and
+attention edges aggregate its Q/K/V input projections, since neither
+reduces to one plain weight matrix the way dense does. Every other layer
+type (norm, pooling, dropout, embedding, positional encoding, residual
+markers, ...) renders as a labeled block; embedding gets a small
+table/grid glyph instead of plain text. `residual_save`/`residual_add`
+pairs additionally get a curved dashed skip-connection edge between them,
+so a ResNet-style block's actual topology is visible instead of two
+disconnected-looking blocks. Batchnorm/layernorm/dropout/pooling/upsample
+are transparent to the diagram (edges drawn straight through them, since
+they don't change channel/feature count). Hover any node or block for a
+tooltip naming its originating layer index.
 
 `plot_genome(genome, sample_input=..., show_disabled=True)` does the same
-for a NEAT `Genome`.
+for a NEAT `Genome` — nodes colored by type (a legend is drawn along the
+bottom), columns labeled by graph depth, edges colored/weighted by
+connection weight and dashed if disabled.
 
 **Using it in a real project:**
 ```python
@@ -2138,10 +2777,10 @@ model.plot(sample_input=x, filename="network.svg")    # raw SVG file
 model.plot(sample_input=x, filename="network.html")   # standalone HTML doc, open in any browser
 ```
 
-Large layers auto-cap (`max_nodes_per_layer=20` default for `plot_network`,
-`30` for `plot_genome`), showing first/last half with a `⋮` marker in
-between — a 784-neuron input layer won't render 784 circles.
-`plot_network` raises `ValueError` on a model with no layers.
+Large layers/depth-columns auto-cap (`max_nodes_per_layer=20` default for
+`plot_network`, `30` for `plot_genome`), showing first/last half with a
+`⋮` marker in between — a 784-neuron input layer won't render 784
+circles. `plot_network` raises `ValueError` on a model with no layers.
 
 ## Evaluation utilities
 
@@ -2172,14 +2811,192 @@ eval_utils.inception_score(samples, classifier=None, splits=10)
 # for anything resembling the standard metric.
 
 eval_utils.frechet_distance(...) / eval_utils.compute_fid(...)
-eval_utils.reconstruction_error(original, reconstructed, metric="mse"|"mae"|"psnr")  # psnr assumes [0,1]-scaled data
+eval_utils.reconstruction_error(original, reconstructed, metric="mse"|"mae"|"psnr", max_val=1.0)
+# max_val only matters for "psnr" -- the data's max possible value (1.0 for
+# [0,1]-scaled data, the default; pass 255 for raw uint8-range images).
 eval_utils.sample_diversity(samples)
-eval_utils.nearest_neighbor_accuracy(...)
+eval_utils.nearest_neighbor_accuracy(real_features, fake_features, k=5)
+# returns the average distance from each fake sample to its k nearest real
+# neighbors (lower = fake samples land close to real data) -- an unbounded
+# distance, not a [0,1] fraction, despite the name.
 ```
+
+### Differentiable audio front ends
+
+```python
+from Enilnets.graph import Tensor, audio_stft, spectrogram, mel_spectrogram, log_mel_spectrogram
+
+x = Tensor(waveform, requires_grad=True)
+feats = log_mel_spectrogram(x, sr=16000, n_fft=512, hop_length=128, n_mels=40)
+feats.sum().backward()          # gradients reach the raw waveform
+```
+`audio/audio_utils.py`'s `stft`/`spectrogram_to_mel` are plain array
+functions with no gradient — fine for preprocessing, useless if the front
+end is part of the model. These graph versions are differentiable.
+
+They are built **entirely from ops that already exist**: framing is a
+gather, the DFT is a matmul against a precomputed complex matrix, and the
+magnitude is the complex `absolute`. So there are no new gradient rules
+here to get wrong, and [complex tensors](#complex-tensors) are what make
+the DFT expressible at all. The STFT is checked against `numpy.fft.rfft` to
+1e-8, and the gradient against finite differences.
+
+- **Cost:** an FFT would be O(N log N) where a DFT matmul is O(N²) per
+  frame. For the frame sizes a from-scratch model actually uses, that buys
+  a differentiable path with no bespoke backward.
+- A real signal gets a **real** gradient even though the STFT is
+  complex-valued in between — under the conjugate-Wirtinger convention the
+  imaginary parts cancel, and the gather's backward takes `.real`
+  explicitly rather than tripping NumPy's silent-cast warning.
+
+### Audio transform pipeline
+
+The [transform pipeline](#transform-pipelines-preprocessing) covers audio
+too: `LoadAudio` (path → waveform), `ToSpectrogram`, `ToMelSpectrogram`,
+`LogCompress`, `AugmentAudio`, plus SpecAugment's `TimeMask` and `FreqMask`.
+
+```python
+from Enilnets import Compose
+from Enilnets.preprocessing import AugmentAudio, ToMelSpectrogram, LogCompress, FreqMask, TimeMask
+
+pipe = Compose([AugmentAudio(sr=16000, noise_std=0.01),
+                ToMelSpectrogram(sr=16000, n_mels=40),
+                LogCompress(), FreqMask(8), TimeMask(10)])
+```
+The masks copy rather than mutate their input, and every audio transform
+preserves the working dtype (`augment_audio`'s float64 noise used to
+promote a float32 signal — fixed at the source).
+
+## Compression: pruning and quantization
+
+Both operate on an already-trained model, and live in
+`Enilnets.compression`.
+
+### Pruning
+
+```python
+from Enilnets import prune_magnitude, PruningSchedule, prune_channels, sparsity
+
+prune_magnitude(model, amount=0.8)      # zero the smallest 80%, and hold them
+model.Train(X, Y, epochs=10)            # fine-tune; the zeros stay zero
+print(sparsity(model)["overall"])       # -> 0.8
+```
+
+| | What it does |
+|---|---|
+| `prune_magnitude(model, amount, scope)` | Zero the smallest-magnitude weights. `scope="global"` ranks the whole model together (layers that matter keep more capacity); `scope="layer"` takes the same fraction from each |
+| `PruningSchedule(model, final, start_step, end_step)` | Ramp sparsity **during** training on Zhu & Gupta's cubic schedule — fast early, tapering later, so the model can recover between the more damaging increments |
+| `prune_channels(model, layer_index, amount)` | **Structured**: remove whole output channels and rewire every consumer, so tensors genuinely shrink |
+| `sparsity(model)` / `clear_masks(model)` | Report actual zeros; stop holding them |
+
+A pruned weight is recorded in `layer["prune_mask"]`, and `apply_gradients`
+enforces it every step — otherwise the very next update would move each
+zeroed weight straight off zero. It also masks the **gradient**, and
+`prune_magnitude` zeroes the corresponding optimizer accumulators: a stale
+momentum on a pruned weight is wasted work and pollutes the adaptive
+denominators of the weights that remain.
+
+**Measured** on a 20→64→4 classifier (cross-entropy; lower is better):
+
+| | loss |
+|---|---|
+| float baseline | 0.201 |
+| pruned 50%, no fine-tune | 0.390 |
+| pruned 80%, no fine-tune | 1.118 |
+| pruned 80%, one-shot then fine-tuned | 0.722 |
+| pruned 90%, one-shot then fine-tuned | 1.166 |
+| **pruned 90% *gradually* via `PruningSchedule`** | **0.710** |
+| quantized 8-bit per-channel | 0.202 |
+| quantized 4-bit per-channel | 0.226 |
+| pruned 50% + quantized 8-bit | 0.390 |
+
+Two things worth reading off that table. **Gradual pruning beats one-shot
+plus fine-tuning** at high sparsity — 0.710 vs 1.166 at 90%, and it even
+beats one-shot at *80%*; that is the whole reason `PruningSchedule` exists,
+and it holds on 5/5 seeds. And **8-bit quantization is essentially free**
+(0.201 → 0.202) where pruning always costs something, so if you only do one
+of the two, quantize.
+
+The masks cost **1.01×** per training step — effectively nothing — and the
+one-off passes are milliseconds on ~530k parameters.
+
+**Structured vs magnitude pruning** is the real distinction. Magnitude
+pruning leaves shapes untouched, so the model is *sparser* but not smaller
+or faster in NumPy. `prune_channels` actually shrinks the tensors — which
+is why it is restricted: the consuming layer's input axis has to be
+narrowable unambiguously. Conv → batchnorm → conv, conv → pool → flatten →
+dense and dense → dense all work (the flatten's channel-to-column block
+size is derived from the widths); anything else raises rather than
+silently corrupting the model.
+
+### Quantization
+
+```python
+from Enilnets import quantize_weights, ActivationCalibrator
+
+report = quantize_weights(model, bits=8, per_channel=True)
+print(report["mean_abs_error"], report["compression"])   # -> ~7e-4, 4.0
+
+cal = ActivationCalibrator(model, bits=8)
+for batch in calibration_batches:
+    cal.observe(batch)
+cal.apply()                     # Forward now quantizes activations too
+```
+
+**Be clear about what this buys you.** NumPy has no int8 matmul — it would
+upcast immediately — so this does **not** make inference faster. It
+reproduces the accuracy effect *exactly*, so you can measure whether a
+model survives 8-bit (or 4-bit) before committing to a deployment target,
+and it stores the integer representation plus scales so a saved model can
+be a quarter the size. Weights are left **fake-quantized**: rounded onto
+the integer grid and mapped back to float, which is precisely what an
+integer kernel would reconstruct.
+
+- `scheme="symmetric"` (default) centres the grid on zero, so an exact zero
+  stays exactly zero — which matters a lot for a pruned or ReLU'd tensor.
+  `"asymmetric"` uses the full range, better for one-sided data.
+- `per_channel=True` gives each output channel its own scale. One outlier
+  channel then cannot force a coarse grid on all the others — measured
+  **>50× lower error on the remaining channels** in that situation.
+- Activation ranges cannot be read off the weights; they depend on the
+  data, which is what the calibration pass is for.
+
+### Quantization-aware training
+
+```python
+from Enilnets.graph import QATLinear
+
+layer = QATLinear(n_in, n_out, bits=4, per_channel=True)
+```
+PTQ rounds a finished model and measures the damage. QAT makes the model
+*train through* the rounding so it learns weights that survive it.
+
+The whole difficulty is the gradient: rounding has a derivative of zero
+almost everywhere, so backpropagating it honestly would stop training dead.
+The answer is the **straight-through estimator**, implemented here as a
+single `custom_op` — no hand-derived backward anywhere. It is *clipped*:
+gradient passes through inside the representable range and is zeroed
+outside, since a value that saturated the grid cannot be improved by being
+pushed further out.
+
+- **Correctness:** a test asserts the pass-through/clip rule directly, that
+  a QAT step is a descent direction on the quantized loss, and — the
+  sharpest check — that at 12 and 16 bits QAT training reaches the *same*
+  loss as training with no quantization at all, i.e. the estimator is
+  transparent when the grid is fine.
+- A finite-difference check is **meaningless here by design**: the STE is
+  deliberately not the true derivative.
+- **How to use it:** QAT is fine-tuning *from* a trained model, with a
+  decayed learning rate, stochastic batches, and keeping the best quantized
+  checkpoint. Trained from scratch it is strictly harder than plain
+  training, because the estimator's noise is pure cost until the model is
+  near a solution. In that fine-tuning regime it beats PTQ at 2 and 3 bits,
+  where PTQ is genuinely broken; at 8 bits PTQ is already near-free and
+  there is nothing to win.
 
 ## Data utilities
 
-### General (`utils.py`)
+### General (`core/utils.py`)
 
 ```python
 from Enilnets import set_seed, train_test_split, k_fold_split, iterate_minibatches, count_parameters, one_hot
@@ -2188,17 +3005,136 @@ set_seed(0)                                              # seed NumPy's global R
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, seed=0)
 for fold_X_train, fold_X_val, fold_y_train, fold_y_val in k_fold_split(X, y, k=5, seed=0):
     ...                                                   # generator, one split per fold
-for xb, yb in iterate_minibatches(X, y, batch_size=32, shuffle=True):
+for xb, yb in iterate_minibatches(X, y, batch_size=32, shuffle=True, seed=None):
     ...                                                   # generator, one minibatch at a time
 total, per_layer = count_parameters(model)                # -> (int, list of dicts)
 oh = one_hot(np.array([0, 2, 1]), num_classes=3)           # -> one-hot array
 ```
-`train_test_split`'s `seed=None` uses the *global* `np.random` state (not
-reproducible across calls unless you called `set_seed` first); pass `seed`
-for an isolated, reproducible split. `k_fold_split` distributes remainder
-samples (`n % k`) one-per-fold to the first folds.
+`train_test_split`/`iterate_minibatches`'s `seed=None` uses the *global*
+`np.random` state (not reproducible across calls unless you called
+`set_seed` first); pass `seed` for an isolated, reproducible split/shuffle.
+`k_fold_split` distributes remainder samples (`n % k`) one-per-fold to the
+first folds.
 
-### Text (`text_utils.py`)
+### Datasets and the DataLoader
+
+`iterate_minibatches` above is fine for arrays that fit in memory. When
+they don't, or when you want augmentation, prefetching or worker threads,
+use a `Dataset` and a `DataLoader`.
+
+```python
+from Enilnets import DataLoader, ArrayDataset, random_split
+
+train, val = random_split(ArrayDataset(X, Y), [0.8, 0.2], seed=0)
+loader = DataLoader(train, batch_size=32, shuffle=True, seed=0)
+
+model.Train(loader, epochs=20)          # Train() accepts a loader in place of (X, Y)
+for xb, yb in loader:                   # ...or iterate it yourself
+    model.TrainBatch(xb, yb)
+```
+
+`DataLoader` accepts a `Dataset`, an `(X, Y)` pair, a bare `X`, or a
+callable returning a fresh iterator — so it is a drop-in wherever
+`iterate_minibatches` was.
+
+| Dataset | What it is |
+|---|---|
+| `ArrayDataset(X, Y=None)` | In-memory arrays, held **by reference** (never copied) |
+| `MemmapDataset(path, shape, dtype, ...)` | An on-disk array via `np.memmap` — rows page in as touched, so the file may be far larger than RAM |
+| `StreamingDataset(factory)` | A *factory* returning a fresh iterator; unknown length, yielded in order |
+| `Subset(ds, indices)` / `ConcatDataset([...])` | Views: a reordered slice, or several datasets end to end (`a + b`) |
+| `ds.map(fn)` | A lazy per-sample transform |
+| `random_split(ds, [0.8, 0.2], seed=0)` | Disjoint `Subset`s; counts or fractions |
+
+`StreamingDataset` takes a **callable**, not an iterator, and rejects an
+iterator explicitly — an iterator would be exhausted after one epoch and
+silently yield nothing thereafter.
+
+**DataLoader options.** `batch_size`, `shuffle` (reshuffled every epoch,
+reproducibly from `seed`), `drop_last`, `transform` (applied to the
+collated *batch*), `collate` (custom stacking), `shuffle_buffer` (for
+streams, which have nothing to permute), `prefetch`, and
+`num_workers`/`worker_backend`.
+
+**On workers — what actually helps.** Measured on 64 samples, batch 8:
+
+| Per-sample work | serial | 4 threads | 4 processes |
+|---|---|---|---|
+| I/O-bound (a real file read) | 0.129 s | 0.034 s (**3.8×**) | — |
+| NumPy-heavy | 0.345 s | 0.134 s (**2.6×**) | 0.103 s (**3.3×**) |
+| Pure Python | 0.055 s | 0.071 s (**0.8×**) | 0.019 s (**2.9×**) |
+
+Threads help exactly when `__getitem__` releases the GIL — file and memmap
+reads, NumPy work — and are *slower* than serial for pure-Python work,
+where the pool overhead buys nothing. Processes help in both cases, but
+`worker_backend="process"` requires a **picklable** dataset (no lambdas, no
+locally-defined classes) and is refused under GPU mode, since device arrays
+do not cross process boundaries. Both conditions are checked at
+construction, not mid-epoch. Threads remain the default because they work
+with any dataset.
+
+`prefetch=n` keeps `n` batches ready on a background thread; an exception
+raised while producing surfaces in the consuming loop rather than
+disappearing with the thread. It pays off when producing a batch is slow
+and *costs* when it is instant — on in-memory arrays it roughly triples a
+1 ms epoch, so leave it off unless the dataset does real work per batch.
+
+**The DataLoader is not a tax.** Array-backed datasets gather a whole batch
+in one indexing operation rather than fetching rows one at a time, so the
+convenience is close to free. One epoch over 20 000 × 64 samples at batch
+128:
+
+| | per epoch |
+|---|---|
+| `iterate_minibatches` | 1.20 ms |
+| `DataLoader(X, Y)` | 1.28 ms (1.07×) |
+| `DataLoader` over a `random_split` subset | 1.07 ms (0.90×, it is 80% of the data) |
+
+The fast path is skipped where it cannot apply — worker pools, a custom
+`collate`, or a per-sample `.map()` are all inherently per-sample — and a
+test pins that both paths produce byte-identical batches.
+
+### Transform pipelines (`preprocessing/`)
+
+```python
+from Enilnets import Compose, DataLoader, ArrayDataset
+from Enilnets.preprocessing import OnX, ToDtype, Scale, Normalize, RandomFlip, RandomCrop
+
+augment = OnX(Compose([
+    ToDtype(), Scale(1 / 255), Normalize(0.5, 0.5),
+    RandomFlip(), RandomCrop(32, padding=4),
+]))
+loader = DataLoader(ArrayDataset(X, Y).map(augment), batch_size=64)
+```
+A transform is any callable `sample -> sample`. `Compose` chains them, and
+there are two places to attach one — the difference matters:
+
+- **`dataset.map(t)`** runs per *sample*, so a random transform draws fresh
+  randomness for each one. What augmentation wants.
+- **`DataLoader(transform=t)`** runs on the collated *batch*, so one
+  vectorized call covers it but a random draw is shared across the batch.
+  Cheaper; correct for deterministic transforms like normalization.
+
+`OnX`/`OnY` apply an inner transform to only one half of an `(x, y)`
+sample, so an image augmentation and a label transform can sit in the same
+`Compose` without either knowing the sample's shape.
+
+Available: `ToDtype`, `Scale`, `Normalize`, `Clip`, `Reshape`, `OneHot`,
+`RandomFlip`, `RandomCrop`, `CenterCrop`, `Resize`, `RandomNoise`,
+`Augment`, `AugmentAudio`, `PadSequence`, `Tokenize`, plus the combinators
+`Compose`, `OnX`, `OnY`, `Lambda`, `RandomApply` and `OneOf`.
+
+- **`Normalize` applies fixed statistics**, unlike
+  `preprocessing.normalize_images`, which *computes* them from the data it
+  is handed — doing that per batch would normalize every batch differently.
+- **Every transform preserves the working dtype.** This needed fixing:
+  `Normalize`'s constants, `Resize`'s resampler and `image_augmentation`'s
+  random draws were each float64, so a float32 batch came out float64 and
+  reached a float32 model promoted. Pinned by a test.
+- `Augment` (the existing `image_augmentation`) is batch-only and expects
+  float images already in [0, 1] — it clips to that range.
+
+### Text (`text/text_utils.py`)
 
 The `Tokenizer` class is covered above under
 [Text generation](#text-generation-textgenerator). Also:
@@ -2208,10 +3144,12 @@ from Enilnets.text_utils import load_text_file, load_texts_from_directory, creat
 text = load_text_file("corpus.txt", encoding='utf-8')
 texts = load_texts_from_directory("corpus_dir/", max_files=100)   # silently skips undecodable files
 X, y = create_sliding_windows(token_ids, window_size=64, stride=1)  # -> next-token-prediction pairs
-padded = pad_sequences([[1,2,3], [4,5]], max_length=5, pad_value=0)
+padded = pad_sequences([[1,2,3], [4,5]], max_length=5, pad_value=0, dtype=np.int32)
+# dtype defaults to int32 (token-id sequences); pass e.g. backend.default_dtype()
+# to pad batches of continuous-feature sequences instead.
 ```
 
-### Images (`image_utils.py`)
+### Images (`vision/image_utils.py`)
 
 ```python
 from Enilnets import image_utils
@@ -2223,16 +3161,20 @@ image_utils.rgb_to_grayscale(rgb) / image_utils.grayscale_to_rgb(gray)
 image_utils.resize_nearest_neighbor(img, new_height, new_width)
 image_utils.resize_bilinear(img, new_height, new_width)
 image_utils.image_augmentation(images, flip_h=True, flip_v=False, rotate=0, brightness=0.0, contrast=0.0, noise_std=0.0)
+# images: (N, C, H, W) or (N, H, W) grayscale -- NCHW, matching this
+# library's conv2d convention (NOT (N, H, W, C)). rotate is a CAP on
+# {0,90,180,270}, not a continuous angle -- rotate=45 allows no rotation
+# at all (90 > 45), rotate=90 allows {0,90}, rotate=360 allows all four.
 image_utils.normalize_images(images, mean=None, std=None)   # -> (normalized, mean, std) -- 3-tuple
 image_utils.denormalize_images(images, mean, std)
-image_utils.images_to_patches(images, patch_size, stride=None)
+image_utils.images_to_patches(images, patch_size, stride=None)  # images: (N, C, H, W) -- NCHW
 image_utils.pad_image(img, pad_h, pad_w, mode='constant', constant_value=0)
 ```
 `load_ppm`/`load_pgm` raise `ValueError` for anything other than binary
 P6/P5 with `maxval=255` — no ASCII PPM/PGM support. `image_augmentation`'s
 `rotate` is a 90°-multiple ceiling, not an arbitrary-angle rotation.
 
-### Audio (`audio_utils.py`)
+### Audio (`audio/audio_utils.py`)
 
 ```python
 from Enilnets import audio_utils
@@ -2254,7 +3196,7 @@ augmented = audio_utils.augment_audio(audio, sr, pitch_shift=0, time_stretch=1.0
 anti-aliasing — adequate for data augmentation, not studio-quality
 processing.
 
-### Cross-modal (`crossmodal_utils.py`)
+### Cross-modal (`crossmodal/crossmodal_utils.py`)
 
 ```python
 from Enilnets import crossmodal_utils
@@ -2270,7 +3212,7 @@ modalities (each sample gets its own per-modality weighting), unlike
 doesn't build any network — it returns a plain dict of suggested
 hyperparameters; treat it as a config template, not a working constructor.
 
-### Dataset loaders (`datasets.py`)
+### Dataset loaders (`datasets/loaders.py`)
 
 ```python
 from Enilnets.datasets import load_mnist, load_cifar10
@@ -2393,12 +3335,391 @@ Full constant list (grouped by subsystem):
 | `NEAT_SURVIVAL_THRESHOLD` | `0.2` | NEAT reproduction |
 | `NEAT_STAGNATION_LIMIT` | `15` | NEAT species stagnation |
 
+## Autograd (`Enilnets.graph`)
+
+An **additive** reverse-mode automatic-differentiation engine (roadmap
+Phase 1). It coexists with `NeuralNet` and never replaces it: everything
+documented above keeps working unchanged, and nothing about `NeuralNet`
+uses `graph/` internally. New code can opt into building models where
+gradients are derived automatically instead of hand-written per layer.
+
+The graph is **dynamic**: it's recorded by tracing your actual Python
+execution as it happens (define-by-run, like PyTorch) — there is no
+separate graph-definition step.
+
+```python
+import numpy as np
+from Enilnets.graph import Tensor, ops
+
+w = Tensor(np.random.randn(3, 2), requires_grad=True)
+x = Tensor(np.random.randn(4, 3))          # wraps by reference, never copies
+
+loss = ops.relu(x @ w).sum()               # ordinary math, recorded as a graph
+loss.backward()                            # reverse-mode autodiff
+print(w.grad)                              # dloss/dw, shape (3, 2)
+```
+
+Highlights:
+
+- **Operator sugar**: `+ - * / ** @`, slicing/int-array indexing, and
+  method forms (`x.tanh()`, `x.sum(axis=0)`, `x.reshape(...)`) all record
+  gradients. Broadcasting works everywhere NumPy allows it; gradients are
+  reduced back to each input's shape automatically.
+- **`no_grad()`** context manager for inference (no graph, no memory
+  overhead); **`Tensor.detach()`** to cut gradients at a point.
+- **Backend/precision transparent**: tensors live on whatever backend the
+  global `use_gpu()` / `use_float64()` switches selected, same as every
+  other module.
+- **Free interop with `NeuralNet`**: `t.data` is the raw NumPy/CuPy array
+  (never a copy), so graph outputs feed `model.Forward(t.data)` with zero
+  boundary cost, and existing weight arrays can seed graph tensors by
+  reference.
+
+### Defining a custom op
+
+Every built-in op is two pieces — a forward formula and one local-gradient
+rule — and user ops use the identical public API (`custom_op`), so
+extending the engine never means editing a central dispatch table:
+
+```python
+from Enilnets.graph import custom_op
+
+sqerr = custom_op(
+    "sqerr",
+    forward=lambda a, b: (a - b) ** 2,                     # raw-array math
+    backward=lambda g, out, a, b: (2*g*(a-b), -2*g*(a-b)), # one grad per input
+)
+loss = sqerr(pred, target).mean()
+loss.backward()          # flows through your op like any built-in
+```
+
+`backward` receives the upstream gradient `g`, the forward result `out`
+(reusable, e.g. sigmoid's `g * out * (1-out)`), and the raw inputs; return
+`None` for non-differentiable inputs. Gradient rules for all built-in ops
+are verified against finite-difference numerical gradients in the test
+suite (`TestGraphOps`), and new ops should get the same treatment.
+
+### Custom layers with automatic gradients
+
+`Layer` is the `graph/` counterpart of the `add_*` builder API: compose
+ops in a `forward()` and every parameter's gradient arrives via
+`backward()` — no hand-derived backward pass, no dispatch-table entry.
+`Linear`, `ReLU`/`Tanh`/`Sigmoid`, `Dropout`, and `Sequential` are
+provided; subclass `Layer` for anything else:
+
+```python
+from Enilnets.graph import Layer, Parameter, Linear, ReLU, Sequential, Tensor, ops
+
+class Gated(Layer):                       # a custom layer
+    def __init__(self, n_in, n_out):
+        super().__init__()
+        self.w = Parameter(np.random.randn(n_in, n_out) * 0.1)
+        self.g = Parameter(np.random.randn(n_in, n_out) * 0.1)
+    def forward(self, x):
+        return ops.tanh(x @ self.w) * ops.sigmoid(x @ self.g)
+
+model = Sequential(Linear(2, 16), ReLU(), Gated(16, 8), Linear(8, 1))
+for _ in range(100):                      # a manual training loop
+    model.zero_grad()
+    loss = ((model(X) - Tensor(Y)) ** 2).mean()
+    loss.backward()
+    for p in model.parameters():          # parameters() finds them all
+        p.data -= 0.05 * p.grad
+```
+
+`parameters()` discovers every `Parameter` in the layer, its sub-layers,
+and lists thereof — no registration calls. `train()`/`eval()` toggle
+`Dropout`-style behavior, mirroring `NeuralNet.train()`/`.eval()`.
+
+**Interop is free in both directions**: `Linear` uses the same
+`(n_out, n_in)` weight convention as `add_dense`, and `Parameter` wraps
+arrays by reference — so `Parameter(model.layers[0]["weights"])` shares
+(not copies) an existing `NeuralNet`'s weights, and a graph block's
+`.data` output feeds `model.Forward(...)` without any boundary copy.
+
+### Named tensors
+
+Optional per-dimension labels — a pure metadata layer (storage and math
+untouched) that catches axis mistakes and lets reductions address axes by
+meaning:
+
+```python
+x = Tensor(data, names=("batch", "time", "feature"))
+x.mean(axis=x.axis("time"))        # reduce by name; result: ("batch", "feature")
+x + y_with_different_names          # ValueError — the mistake names exist to catch
+```
+
+Names propagate where output dims provably correspond to input dims
+(elementwise/broadcast ops merge right-aligned, reductions drop the
+reduced name, `transpose` permutes); shape-changing ops (`reshape`,
+`matmul`, indexing, `concatenate`) conservatively drop them rather than
+guess. `set_names(...)` labels in place; `None` entries leave dims
+unnamed.
+
+### Complex tensors
+
+`graph/` tensors support complex dtypes end to end (the groundwork for
+future FFT/spectral layers): Python complex input coerces to
+`complex64`/`complex128` following the float32/float64 default, and
+`conj()`, `real()`, `imag()`, `abs()` are differentiable ops. Gradients
+follow the PyTorch/JAX convention — for a real-valued loss the stored
+gradient is `dL/dRe(z) + 1j·dL/dIm(z)`, so plain gradient descent works
+unchanged — and every rule (including complex `matmul`/`mul`/`div`) is
+verified against per-part finite differences in the test suite. Real
+tensors are entirely unaffected (the conjugations are identities there).
+
+### Mixed precision in `graph/` (autocast)
+
+The `graph/` counterpart of `NeuralNet(use_mixed_precision=True)`, done
+the graph-native way: precision changes are **cast ops with defined
+gradients**, visible in traces, not a hidden forward-side detail. Inside
+`autocast()`, `matmul` runs at float32 even under a float64 default; the
+result is cast back, and gradients flow through the casts so master
+weights receive float64 gradients. A no-op when float32 is already the
+default:
+
+```python
+from Enilnets.graph import autocast, cast
+
+with autocast():
+    loss = ((model(X) - Tensor(Y)) ** 2).mean()   # matmuls run at float32
+loss.backward()                                    # float64 master grads
+```
+
+`cast(x, dtype="float32")` is also available directly as an ordinary
+differentiable op (its gradient casts back to the input's dtype).
+
+### Gradient checkpointing
+
+Trade compute for memory: `checkpoint(fn, *inputs)` runs a segment
+without storing its internal activations, then re-runs the segment's
+forward during `backward()` — gradient-identical to the normal path
+(pinned by tests to 1e-12):
+
+```python
+from Enilnets.graph import checkpoint
+
+h = checkpoint(block1, x)     # block1's interior is NOT kept alive
+y = block2(h)                 # block2 behaves normally
+y.sum().backward()            # block1 re-runs here, then backprops
+```
+
+The segment appears in traces as one composite `checkpoint(...)` node.
+Keep checkpointed segments deterministic — a `Dropout` inside one would
+draw fresh randomness on recompute (the standard caveat, same as
+PyTorch's checkpoint).
+
+### Functional API and lazy layers
+
+`Enilnets.functional` (also `Enilnets.graph.functional`) offers the
+stateless spelling of the graph ops — no layer objects, no stored state,
+gradients included: `relu`, `softmax`, `linear(x, w, b)`, `dropout`,
+`mse_loss`, `cross_entropy(logits, class_indices)` (numerically stable,
+log-sum-exp based), and friends:
+
+```python
+import Enilnets.functional as F
+loss = F.cross_entropy(F.linear(x, w, b), targets)
+loss.backward()
+```
+
+`LazyLinear(n_out)` defers weight creation until the first call infers
+`n_in` from the input — the graph-side counterpart of the `add_*`
+builders' auto shape inference. Run one batch through a lazy model
+before handing `parameters()` to an optimizer (it's empty until then).
+
+### DropBlock & Stochastic Depth
+
+`DropBlock2D(rate, block_size)` drops contiguous spatial blocks of a
+feature map (per-pixel dropout under-regularizes correlated conv
+features); survivors rescale to preserve the expectation, `seeds=` is the
+reproducibility hook. `StochasticDepth(branch, survival_prob)` wraps a
+residual branch and drops it per-example at train time (inverted
+rescale), running it always in eval — compose as `y = x + branch(x)`.
+
+### Dropout variants: Gaussian & Alpha
+
+`GaussianDropout(rate)` multiplies by `N(1, rate/(1-rate))` noise at
+train time (same expectation as ordinary dropout, smooth instead of hard
+zeros). `AlphaDropout(rate)` is the SELU-compatible variant: dropped
+units go to SELU's negative saturation value and an affine correction
+keeps a self-normalized input at mean 0 / variance 1 (verified
+statistically in the tests). Both are identity in eval mode.
+
+### Convolution variants (graph)
+
+`graph.conv2d` / `conv1d` implement the whole item-35 family as one
+gather+matmul composite (zero convolution-specific gradient code):
+`stride`, symmetric zero `padding`, `dilation`, and `groups`
+(`groups=in_ch` = depthwise). `causal_conv1d` left-pads by
+`dilation·(k-1)` so `output[t]` sees only inputs `≤ t` (WaveNet-style).
+Layer forms: `Conv2D`, `Conv1D(causal=...)`, and `SeparableConv2D`
+(depthwise + pointwise, the MobileNet block). The base case is pinned
+numerically equal to `add_conv2d`; dilation/groups/causal are verified
+against manual references and finite differences.
+
+`conv3d` generalizes the same composite to `(B, C, D, H, W)` volumes, and
+`conv_transpose1d/2d/3d` provide transposed ("de")convolution via
+zero-stuffing + flipped-kernel conv — weights use the `(in, out, k, …)`
+transposed convention, `output_padding` recovers sizes a strided conv
+discarded, and each is the **exact adjoint** of its forward conv
+(`⟨conv(x,w), y⟩ = ⟨x, convᵀ(y,w)⟩`, pinned across stride/padding
+combinations).
+
+### Adaptive & fractional pooling, MaxUnpool
+
+`adaptive_avg_pool2d` / `adaptive_max_pool2d(x, (oh, ow))` pool any input
+size to a fixed output grid (PyTorch-style bin edges).
+`fractional_max_pool2d` (Graham 2014) places the bin boundaries
+pseudo-randomly (`random_u=(uh, uw)` fixes the draws for
+reproducibility). `max_pool2d_with_indices` returns the argmax positions
+that `max_unpool2d(values, indices, (H, W))` uses to invert the pooling
+(values return to their exact argmax cells, zeros elsewhere). All are
+composites of existing differentiable ops, FD-verified; `max_pool2d`
+matches `add_maxpool2d`'s non-overlapping semantics (pinned).
+
+### PixelShuffle / PixelUnshuffle
+
+Sub-pixel rearrangement for upsampling decoders:
+`functional.pixel_shuffle(x, r)` turns `(B, C·r², H, W)` into
+`(B, C, H·r, W·r)` (layer forms `PixelShuffle(r)` / `PixelUnshuffle(r)`).
+Pure reshape/transpose composites — exact round trip, gradients are the
+inverse rearrangement (pinned in tests).
+
+### Padding modes
+
+`ops.pad` (layer form: `Pad`) pads any-rank tensors with full gradient
+support in four modes: `"constant"` (zeros or a value), `"reflect"`,
+`"edge"` (replication), `"wrap"` (circular). Reflection/edge/wrap copy
+source cells into the padding, and each source cell's gradient correctly
+sums over every copy (FD-verified per mode):
+
+```python
+from Enilnets.graph import Pad, ops
+y = ops.pad(x, pad_width=((0,0), (0,0), (1,1), (1,1)), mode="reflect")  # NCHW spatial pad
+```
+
+### Variable-length sequences: padding masks & packed sequences
+
+The graph API settles the variable-length-batch representation (and
+closes the "attention has no padding-mask support" gap graph-side; the
+`nn/` layers are unchanged):
+
+```python
+from Enilnets.graph import (lengths_to_mask, pack_padded, pad_packed,
+                            MultiHeadAttention, masked_mean)
+
+mask = lengths_to_mask([5, 3, 2], max_len=5)   # (batch, seq) bool, True = real
+attn = MultiHeadAttention(embed_dim=64, num_heads=4)  # causal/num_kv_heads/window_size too
+h = attn(x, key_padding_mask=mask)             # padded keys get ~0 attention
+pooled = masked_mean(h, mask)                  # padding-aware mean pooling
+
+packed = pack_padded(x, lengths)               # (total_tokens, F), no padding
+restored = pad_packed(packed)                  # differentiable round trip
+```
+
+`MultiHeadAttention` uses the same `Wq..Wo` weight conventions as
+`add_multihead_attention` (output equivalence with shared weights is
+pinned in the tests), so weights move freely between the two paths. It
+takes the same `num_kv_heads` (MHA/MQA/GQA) and `window_size`
+(sliding-window) settings, with matching weight shapes, so those layers are
+shareable across the two paths too.
+Packing/unpacking are built from differentiable gathers — gradients flow
+through, and padding slots receive exactly zero gradient.
+
+### Tracing and exporting the graph
+
+The dynamic graph a computation records can be exported as a symbolic
+structure — introspect it, print it, or re-execute it on new inputs
+(`symbolic_trace` marks the example inputs as placeholders):
+
+```python
+from Enilnets.graph import symbolic_trace, ops
+
+def f(x):
+    return ops.relu(x @ w + b)
+
+graph = symbolic_trace(f, example_x)   # runs f once, captures the op graph
+print(graph)                            # id / kind / op / parents / shape table
+y = graph.run(new_x)                    # re-execute with a fresh input
+```
+
+Captured weights become constant nodes holding **references** (not
+snapshots) — re-running after a training step sees the updated weights.
+Python control flow is baked in as traced (one branch, loops unrolled),
+the standard trade-off of trace-based export. `trace(output_tensor)` does
+the same for a graph you already have in hand.
+
+### Optimizing a traced graph
+
+Traced graphs can be transformed before re-execution — `optimize` applies
+dead-node elimination, constant folding (input-independent subgraphs are
+precomputed; note folded values are snapshots of the weights at optimize
+time), and elementwise-chain fusion (`relu(tanh(exp(x)))` collapses to one
+fused node), each preserving `run()` results exactly:
+
+```python
+from Enilnets.graph import symbolic_trace, optimize
+
+graph = symbolic_trace(f, example_x)
+fast = optimize(graph)                 # fewer nodes, same outputs
+y = fast.run(new_x)
+```
+
+The individual passes (`eliminate_dead_nodes`, `fold_constants`,
+`fuse_elementwise`) are importable separately. Eager Tensor math is never
+affected — these operate only on the exported symbolic representation.
+
+## Package layout
+
+As of the Phase 0 reorganization (see `ROADMAP.md`), the library is split
+into topic-scoped subpackages instead of one flat directory:
+
+```
+Enilnets/
+├── core/           # NeuralNet skeleton (base.py), NumPy/CuPy backend switch
+│                   #   (backend.py), constants.py, general utils.py
+├── nn/             # layer builders, forward/backward dispatch, activations,
+│                   #   weight init, training loop (train.py), Save/Load (io.py)
+├── optim/          # optimizer update rules (optimizer.py)
+├── losses/         # ComputeLoss (loss.py)
+├── metrics/        # eval_metrics.py, eval_utils.py
+├── generative/     # VAE/GAN/Diffusion/Flow/EBM/UNet/TextGenerator
+├── reinforcement/  # Evolve/Reinforce/PPO/ActorCritic, compute_returns, gae
+├── evolving/       # NEAT (neat.py)
+├── vision/         # image_utils.py (I/O, resize, patches)
+├── text/           # text_utils.py (Tokenizer, windows, one-hot)
+├── audio/          # audio_utils.py (WAV I/O, STFT/mel)
+├── datasets/       # loaders.py (load_mnist, load_cifar10)
+├── preprocessing/  # augmentation/normalization transforms (image/audio/text)
+├── visualization/  # plotting.py (plot_network, plot_genome, to_html)
+└── crossmodal/     # crossmodal_utils.py (contrastive loss, fusion)
+```
+
+**Every pre-reorganization import path still works.** The old flat module
+names (`Enilnets.base`, `Enilnets.backend`, `Enilnets.layers`,
+`Enilnets.neat`, `Enilnets.image_utils`, ...) are registered as aliases of
+their new homes, so both spellings below are the same module object:
+
+```python
+from Enilnets.neat import Genome            # old flat path — still works
+from Enilnets.evolving.neat import Genome   # new canonical path
+```
+
+New code should prefer the subpackage paths; the aliases exist so nothing
+existing breaks.
+
 ## Full API index
 
 Everything importable as `from Enilnets import X`:
 
 ```
-NeuralNet, LRScheduler,
+NeuralNet, LRScheduler, KVCache, cached_forward_step, BPETokenizer,
+prune_magnitude, prune_channels, PruningSchedule, sparsity,
+quantize_weights, ActivationCalibrator,
+EMA, SWA, find_learning_rate,
+DataLoader, Dataset, IterableDataset, ArrayDataset, MemmapDataset,
+StreamingDataset, Subset, ConcatDataset, random_split, Compose,
 VAE, GAN, DiffusionModel, AutoregressiveModel, RealNVP, EnergyBasedModel,
 UNetDenoiser, time_embedding, TextGenerator, Tokenizer,
 reparameterize, langevin_dynamics, gaussian_sample, uniform_sample,
@@ -2428,7 +3749,10 @@ a direct import), `Enilnets.io`, `Enilnets.reinforce`, `Enilnets.forward`,
 `plot_genome`/`to_html` re-exported), `Enilnets.datasets` (`load_mnist`/
 `load_cifar10`), and within `Enilnets.generative`:
 `Enilnets.generative.sampling.gae`, `Enilnets.generative.pretrained`
-(`build_vgg16_feature_extractor`).
+(`build_vgg16_feature_extractor`); and the autograd package
+`Enilnets.graph` (`Tensor`, `custom_op`, `Layer`/`Linear`/`Sequential`,
+`trace`/`symbolic_trace`, `optimize` — see
+[Autograd](#autograd-enilnetsgraph)).
 
 ## Known limitations
 
@@ -2462,9 +3786,13 @@ up front whether they matter for your use case:
   recurrent layer; expect these to be the slowest layer type for long
   sequences (applies to the bidirectional variants too — roughly 2x the
   cost of a single direction).
-- **`AutoregressiveModel.generate()`/`.complete()` have no KV-cache** (unlike
-  `TextGenerator`) — generation is O(data_dim²) forward passes; slow for
-  high-dimensional data.
+- **`AutoregressiveModel.generate()`/`.complete()` cannot use a KV-cache** —
+  it is a MADE-style *masked-dense* model, not an attention stack: each
+  dimension's conditional is produced by a full masked forward pass over the
+  whole (partially filled) vector, so there is no per-position K/V to reuse.
+  Generation is inherently O(data_dim) forward passes; slow for
+  high-dimensional data. `Enilnets.cached_forward_step` applies to attention
+  stacks only (see [KV-cache decoding](#kv-cache-decoding)).
 - **`DiffusionModel.sample()`/`.denoise()` use standard ancestral sampling**
   (O(`time_steps`) sequential steps) — use `sample_ddim()` instead for
   fast generation.
@@ -2492,13 +3820,20 @@ up front whether they matter for your use case:
   side (structurally accurate — there genuinely isn't a single weight
   matrix to draw there).
 - **`TextGenerator.generate()` only supports a single prompt at a time**
-  (no batched generation) — the KV-cache path is hardcoded to batch size 1.
+  (no batched generation) — the token *sampler* is scalar, so the loop runs
+  one stream. The underlying cache mechanism itself is fully batched: call
+  `cached_forward_step` directly (see [KV-cache decoding](#kv-cache-decoding))
+  if you want to decode several streams at once.
+- **The graph `MultiHeadAttention` has no `attention_kernel`** (linear /
+  Performer live on the `nn/` path only) — the causal linearized form needs
+  a prefix-sum (`cumsum`) op with a gradient rule, which `graph/ops.py`
+  does not have yet. Build linearized stacks with `add_transformer_block`.
 - **`add_multihead_attention`/`add_cross_attention` have no padding-mask
   support** for batched variable-length sequences — only `causal=True|False`
   exists; pack sequences to a fixed length instead.
 - **`activate("gelu", ...)` is the tanh approximation only** — no exact
   erf-based variant.
-- **`io.py`'s `.pkl` save/load path uses Python's `pickle`** — only load
+- **`nn/io.py`'s `.pkl` save/load path uses Python's `pickle`** — only load
   `.pkl` checkpoints you trust or produced yourself (arbitrary code
   execution risk on untrusted files, same as any use of `pickle.load`);
   use `.json` if loading from an untrusted source is a real scenario.

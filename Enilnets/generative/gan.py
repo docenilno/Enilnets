@@ -1,17 +1,19 @@
-from ..backend import np
-from .. import backend
-from ..base import NeuralNet
+from typing import Any, Dict, List, Optional
+
+from ..core.backend import np
+from ..core import backend
+from ..core.base import NeuralNet
 
 class GAN:
-    def __init__(self, latent_dim, data_dim, generator_hidden=[256, 512],
-                 discriminator_hidden=[512, 256], g_activation="swish",
-                 d_activation="leakyrelu", loss_type="bce",
-                 learning_rate=0.0002, optimizer="adam", l2_lambda=0.0,
-                 label_smoothing=0.9,
-                 g_lr_factor=1.0,
-                 d_lr_factor=1.0,
-                 wgan_clip_value=0.01,
-                 num_classes=None):
+    def __init__(self, latent_dim: int, data_dim: int, generator_hidden: List[int] = [256, 512],
+                 discriminator_hidden: List[int] = [512, 256], g_activation: str = "swish",
+                 d_activation: str = "leakyrelu", loss_type: str = "bce",
+                 learning_rate: float = 0.0002, optimizer: str = "adam", l2_lambda: float = 0.0,
+                 label_smoothing: float = 0.9,
+                 g_lr_factor: float = 1.0,
+                 d_lr_factor: float = 1.0,
+                 wgan_clip_value: float = 0.01,
+                 num_classes: Optional[int] = None) -> None:
         self.latent_dim = latent_dim
         self.data_dim = data_dim
         self.loss_type = loss_type
@@ -44,7 +46,7 @@ class GAN:
         out_activation = "sigmoid" if loss_type == "bce" else "linear"
         self.discriminator.add_dense(prev, 1, activation=out_activation)
 
-    def _onehot(self, y, n):
+    def _onehot(self, y: Optional[Any], n: int) -> Optional[Any]:
         """Validate `y` against `self.num_classes` (raises if one is given
         without the other) and return a one-hot (n, num_classes) array, or
         None if this GAN is unconditional."""
@@ -61,14 +63,14 @@ class GAN:
             raise ValueError(f"y has {y.shape[0]} labels but batch size is {n}")
         return np.eye(self.num_classes, dtype=backend.default_dtype())[y]
 
-    def generate(self, n_samples, y=None):
-        z = np.random.randn(n_samples, self.latent_dim)
+    def generate(self, n_samples: int, y: Optional[Any] = None) -> Any:
+        z = np.random.randn(n_samples, self.latent_dim).astype(backend.default_dtype())
         onehot = self._onehot(y, n_samples)
         if onehot is not None:
             z = np.concatenate([z, onehot], axis=1)
         return self.generator.Forward(z, training=True)
 
-    def discriminate(self, x, y=None):
+    def discriminate(self, x: Any, y: Optional[Any] = None) -> Any:
         x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim > 2:
             x = x.reshape(x.shape[0], -1)
@@ -77,7 +79,8 @@ class GAN:
             x = np.concatenate([x, onehot], axis=1)
         return self.discriminator.Forward(x, training=True)
 
-    def _train_discriminator(self, real_data, fake_data, real_y=None, fake_y=None):
+    def _train_discriminator(self, real_data: Any, fake_data: Any, real_y: Optional[Any] = None,
+                              fake_y: Optional[Any] = None) -> float:
         batch_size = real_data.shape[0]
         fake_bs = fake_data.shape[0]
         total = batch_size + fake_bs
@@ -122,8 +125,8 @@ class GAN:
 
         elif self.loss_type == "wasserstein":
             combined_targets = np.concatenate([
-                np.ones((batch_size, 1)),
-                -np.ones((fake_bs, 1))
+                np.ones((batch_size, 1), dtype=backend.default_dtype()),
+                -np.ones((fake_bs, 1), dtype=backend.default_dtype())
             ], axis=0)
             # loss = mean(-target * out) => dL/dout = -target/N (constant).
             delta = -combined_targets / total
@@ -136,7 +139,7 @@ class GAN:
 
         return 0.0
 
-    def _clip_discriminator_weights(self, clip_value):
+    def _clip_discriminator_weights(self, clip_value: float) -> None:
         """Clip discriminator weights to [-clip_value, clip_value] (Wasserstein GAN)."""
         for layer in self.discriminator.layers:
             if "weights" in layer:
@@ -144,7 +147,7 @@ class GAN:
             if "bias" in layer:
                 layer["bias"] = np.clip(layer["bias"], -clip_value, clip_value)
 
-    def _train_generator(self, fake_data, fake_y=None):
+    def _train_generator(self, fake_data: Any, fake_y: Optional[Any] = None) -> float:
         batch_size = fake_data.shape[0]
         d_fake = self.discriminate(fake_data, y=fake_y)
 
@@ -182,7 +185,24 @@ class GAN:
 
         return 0.0
 
-    def Train(self, X_train, epochs=10, batch_size=64, d_steps=1, g_steps=1, verbose=True, y_train=None):
+    def Train(self, X_train: Any, epochs: int = 10, batch_size: int = 64, d_steps: int = 1,
+              g_steps: int = 1, verbose: bool = True, y_train: Optional[Any] = None,
+              callbacks: Optional[List[Any]] = None) -> Dict[str, List[float]]:
+        """callbacks: optional list of duck-typed callback objects (same
+        convention as TextGenerator.Train/NeuralNet.Train). Supported hooks:
+          on_batch_end(epoch, batch_idx, loss, model=self) -- after every
+            minibatch's d_steps+g_steps; loss is (d_loss, g_loss) here,
+            since GAN training tracks both losses rather than one.
+          on_epoch_end(epoch, logs, model=self) -- once per epoch, with
+            logs={"d_loss": ..., "g_loss": ...} (this epoch's averages).
+          on_train_end(history) -- once after the epoch loop.
+        Missing methods are skipped (no error)."""
+        if d_steps < 1 or g_steps < 1:
+            raise ValueError(
+                f"d_steps={d_steps} and g_steps={g_steps} must both be >= 1 "
+                "-- with either at 0, d_loss/g_loss would never be assigned "
+                "before use in the training loop below."
+            )
         X = np.asarray(X_train, dtype=backend.default_dtype())
         if X.ndim > 2:
             X = X.reshape(X.shape[0], -1)
@@ -201,7 +221,7 @@ class GAN:
             epoch_g_loss = 0.0
             n_batches = 0
 
-            for i in range(0, n_samples, batch_size):
+            for batch_idx_num, i in enumerate(range(0, n_samples, batch_size)):
                 batch_idx = indices[i:i+batch_size]
                 real_batch = X[batch_idx]
                 real_y = y_arr[batch_idx] if y_arr is not None else None
@@ -220,6 +240,9 @@ class GAN:
                 epoch_d_loss += d_loss * bs
                 epoch_g_loss += g_loss * bs
                 n_batches += bs
+                for cb in (callbacks or []):
+                    getattr(cb, "on_batch_end", lambda *a, **k: None)(
+                        epoch, batch_idx_num, (d_loss, g_loss), model=self)
 
             history["d_loss"].append(epoch_d_loss / n_batches)
             history["g_loss"].append(epoch_g_loss / n_batches)
@@ -227,12 +250,20 @@ class GAN:
             if verbose:
                 print(f"Epoch {epoch+1}/{epochs} - D_loss: {history['d_loss'][-1]:.4f} - G_loss: {history['g_loss'][-1]:.4f}")
 
+            for cb in (callbacks or []):
+                getattr(cb, "on_epoch_end", lambda *a, **k: None)(
+                    epoch, {"d_loss": history["d_loss"][-1], "g_loss": history["g_loss"][-1]}, model=self)
+
+        for cb in (callbacks or []):
+            getattr(cb, "on_train_end", lambda *a, **k: None)(history)
+
         return history
 
-    def sample(self, n_samples=16, y=None):
+    def sample(self, n_samples: int = 16, y: Optional[Any] = None) -> Any:
         return self.generate(n_samples, y=y)
 
-    def mode_collapse_score(self, n_samples=1000, n_clusters=10, y=None):
+    def mode_collapse_score(self, n_samples: int = 1000, n_clusters: int = 10,
+                             y: Optional[Any] = None) -> float:
         """Detect mode collapse by measuring sample diversity.
         Returns a score between 0 (all identical) and 1 (fully diverse)."""
         samples = self.generate(n_samples, y=y)

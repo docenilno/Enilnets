@@ -1,14 +1,18 @@
-from ..backend import np
-from .. import backend
+from typing import Any, Optional, Tuple
 
-def reparameterize(mu, logvar):
+from ..core.backend import np
+from ..core import backend
+from ..reinforcement.reinforce import compute_returns, gae
+
+def reparameterize(mu: Any, logvar: Any) -> Any:
     """
     VAE reparameterization trick: z = mu + sigma * eps
     """
-    eps = np.random.randn(*mu.shape)
+    eps = np.random.randn(*mu.shape).astype(backend.default_dtype())
     return mu + np.exp(0.5 * logvar) * eps
 
-def langevin_dynamics(energy_fn, x_init, n_steps=20, step_size=0.1, noise_scale=0.005):
+def langevin_dynamics(energy_fn: Any, x_init: Any, n_steps: int = 20, step_size: float = 0.1,
+                       noise_scale: float = 0.005) -> Any:
     """
     Langevin Monte Carlo sampling for energy-based models.
     energy_fn: callable that takes x and returns (energy, grad_energy)
@@ -16,25 +20,27 @@ def langevin_dynamics(energy_fn, x_init, n_steps=20, step_size=0.1, noise_scale=
     x = x_init.copy()
     for _ in range(n_steps):
         energy, grad = energy_fn(x)
-        x = x - step_size * grad + np.random.randn(*x.shape) * noise_scale
+        noise = np.random.randn(*x.shape).astype(backend.default_dtype())
+        x = x - step_size * grad + noise * noise_scale
     return x
 
-def gaussian_sample(mean, std, shape=None):
+def gaussian_sample(mean: Any, std: Any, shape: Optional[Tuple[int, ...]] = None) -> Any:
     """Sample from N(mean, std^2)."""
     if shape is None:
         shape = mean.shape
-    return mean + std * np.random.randn(*shape)
+    return mean + std * np.random.randn(*shape).astype(backend.default_dtype())
 
-def uniform_sample(low, high, shape):
+def uniform_sample(low: float, high: float, shape: Tuple[int, ...]) -> Any:
     """Sample from Uniform(low, high)."""
-    return np.random.uniform(low, high, shape)
+    return np.random.uniform(low, high, shape).astype(backend.default_dtype())
 
-def gumbel_softmax_sample(logits, temperature=1.0, hard=False):
+def gumbel_softmax_sample(logits: Any, temperature: float = 1.0, hard: bool = False) -> Any:
     """
     Gumbel-Softmax sampling for discrete latent variables.
     logits: (batch, n_classes)
     """
-    gumbel = -np.log(-np.log(np.random.uniform(1e-12, 1.0, logits.shape)))
+    u = np.random.uniform(1e-12, 1.0, logits.shape).astype(backend.default_dtype())
+    gumbel = -np.log(-np.log(u))
     y = logits + gumbel
     y_soft = np.exp(y / temperature) / np.sum(np.exp(y / temperature), axis=-1, keepdims=True)
     if hard:
@@ -44,73 +50,80 @@ def gumbel_softmax_sample(logits, temperature=1.0, hard=False):
         return y_hard - y_soft + y_soft  # straight-through
     return y_soft
 
-def random_mask(shape, ratio):
+def random_mask(shape: Tuple[int, ...], ratio: float) -> Any:
     """Generate a random boolean mask with given keep ratio."""
     return (np.random.rand(*shape) < ratio).astype(backend.default_dtype())
 
-def top_p_sampling(logits, p=0.9, temperature=1.0):
+def nucleus_renormalize(probs: Any, top_p: float) -> Any:
+    """Given a (batch, vocab_size) probability array (each row already
+    summing to 1), zero out every entry outside that row's top-p nucleus and
+    renormalize what's left. The single shared implementation of the actual
+    top-p masking logic -- both top_p_sampling (below) and
+    TextGenerator._sample_token in text_generation.py need exactly this same
+    masking step, just with different final sampling mechanics on top of it
+    (a vectorized batched draw here vs. a single-distribution
+    temperature/top-k/top-p combo there), so this is factored out rather
+    than each keeping its own copy of the sort/cumsum/cutoff logic."""
+    sorted_probs = np.sort(probs, axis=-1)[..., ::-1]
+    sorted_indices = np.argsort(probs, axis=-1)[..., ::-1]
+    cumsum = np.cumsum(sorted_probs, axis=-1)
+    # Nucleus definition (Holtzman et al.): the SMALLEST set whose
+    # cumulative probability reaches top_p -- so the token that crosses the
+    # threshold is kept. "Cumulative mass BEFORE this token < top_p" keeps
+    # exactly that set (and always keeps the top token, since its
+    # before-mass is 0). The previous `cumsum <= top_p` form dropped the
+    # crossing token, leaving a set summing to less than top_p.
+    mask = (cumsum - sorted_probs) < top_p
+
+    masked_sorted = sorted_probs * mask
+    out = np.zeros_like(probs)
+    row_idx = np.arange(probs.shape[0])[:, None]
+    out[row_idx, sorted_indices] = masked_sorted
+    return out / np.sum(out, axis=-1, keepdims=True)
+
+def top_p_sampling(logits: Any, p: float = 0.9, temperature: float = 1.0) -> Any:
     """
     Nucleus (top-p) sampling for discrete distributions.
     logits: (batch, vocab_size)
     """
-    probs = np.exp(logits / temperature)
+    # Subtract the row max before exp (softmax identity): mathematically a
+    # no-op, but avoids overflow to inf for large logits (top_k_sampling
+    # already did this; top_p was the one place that didn't).
+    probs = np.exp((logits - np.max(logits, axis=-1, keepdims=True)) / temperature)
     probs = probs / np.sum(probs, axis=-1, keepdims=True)
-    sorted_probs = np.sort(probs, axis=-1)[:, ::-1]
-    sorted_indices = np.argsort(probs, axis=-1)[:, ::-1]
-    cumsum = np.cumsum(sorted_probs, axis=-1)
-    mask = cumsum <= p
-    mask[:, 0] = True  # always keep at least the top token
+
+    # Renormalize over just the nucleus, then draw one categorical sample per
+    # row via vectorized inverse-CDF sampling (a uniform threshold per row
+    # against the renormalized cumsum) -- avoids a Python loop over the batch
+    # dimension entirely (the earlier per-row np.random.choice loop).
+    masked_probs = nucleus_renormalize(probs, p)
+    masked_cumsum = np.cumsum(masked_probs, axis=-1)
+    u = np.random.rand(logits.shape[0], 1)
+    chosen = np.argmax(masked_cumsum >= u, axis=-1)
 
     result = np.zeros_like(probs)
-    for i in range(probs.shape[0]):
-        valid_indices = sorted_indices[i, mask[i]]
-        valid_probs = sorted_probs[i, mask[i]]
-        valid_probs = valid_probs / np.sum(valid_probs)
-        choice = np.random.choice(valid_indices, size=1, p=valid_probs)[0]
-        result[i, choice] = 1.0
+    result[np.arange(logits.shape[0]), chosen] = 1.0
     return result
 
-def top_k_sampling(logits, k=10, temperature=1.0):
+def top_k_renormalize(probs: Any, k: int) -> Any:
+    """Given a (vocab_size,) probability array (already summing to 1),
+    zero out every entry outside the top-k and renormalize what's left.
+    Single-distribution only (unlike top_p_sampling/nucleus_renormalize,
+    which are batched over (batch, vocab_size)) -- the shared
+    implementation of the actual top-k masking step, used by both
+    top_k_sampling (below) and TextGenerator._sample_token in
+    text_generation.py."""
+    k = min(k, probs.shape[-1])
+    keep = np.argpartition(probs, -k)[-k:]
+    mask = np.zeros_like(probs)
+    mask[keep] = probs[keep]
+    return mask / mask.sum()
+
+def top_k_sampling(logits: Any, k: int = 10, temperature: float = 1.0) -> int:
     """Top-k sampling for a single distribution: keep only the k highest
     logits, renormalize, and sample. logits: (vocab_size,)."""
     logits = np.asarray(logits, dtype=backend.default_dtype())
-    k = min(k, logits.shape[-1])
-    top_idx = np.argpartition(logits, -k)[-k:]
-    top_logits = logits[top_idx] / temperature
-    top_logits -= np.max(top_logits)
-    probs = np.exp(top_logits)
+    probs = np.exp((logits - np.max(logits)) / temperature)
     probs /= probs.sum()
-    return int(np.random.choice(top_idx, size=1, p=probs)[0])
-
-def compute_returns(rewards, gamma=0.99):
-    """
-    Compute discounted returns for a single episode.
-    """
-    rewards = np.asarray(rewards, dtype=backend.default_dtype())
-    returns = np.zeros_like(rewards)
-    running = 0.0
-    for t in reversed(range(len(rewards))):
-        running = rewards[t] + gamma * running
-        returns[t] = running
-    return returns
-
-def gae(rewards, values, gamma=0.99, lambda_=0.95):
-    """
-    Generalized Advantage Estimation (GAE).
-    rewards: (T,) array of step rewards
-    values: (T+1,) array of value estimates (includes V(s_T+1))
-    gamma: discount factor
-    lambda_: GAE lambda parameter
-    Returns advantages: (T,) and returns: (T,)
-    """
-    rewards = np.asarray(rewards, dtype=backend.default_dtype())
-    values = np.asarray(values, dtype=backend.default_dtype())
-    T = len(rewards)
-    advantages = np.zeros(T, dtype=backend.default_dtype())
-    gae_t = 0.0
-    for t in reversed(range(T)):
-        delta = rewards[t] + gamma * values[t + 1] - values[t]
-        gae_t = delta + gamma * lambda_ * gae_t
-        advantages[t] = gae_t
-    returns = advantages + values[:T]
-    return advantages, returns
+    probs = top_k_renormalize(probs, k)
+    return int(np.random.choice(len(probs), size=1, p=probs)[0])

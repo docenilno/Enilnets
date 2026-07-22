@@ -1,8 +1,10 @@
-from ..backend import np
-from .. import backend
-from ..base import NeuralNet
+from typing import Any, List, Optional, Tuple
 
-def time_embedding(t, dim, max_period=10000):
+from ..core.backend import np
+from ..core import backend
+from ..core.base import NeuralNet
+
+def time_embedding(t: Any, dim: int, max_period: int = 10000) -> Any:
     """
     Sinusoidal time embedding for diffusion models.
     t: (batch,) array of timestep indices or (batch, 1)
@@ -11,17 +13,25 @@ def time_embedding(t, dim, max_period=10000):
     """
     t = np.asarray(t, dtype=backend.default_dtype()).reshape(-1)
     half = dim // 2
-    freqs = np.exp(-np.log(max_period) * np.arange(half) / half)
+    # np.log(max_period) returns a float64 numpy scalar, which upcasts the
+    # whole expression to float64 regardless of np.arange's own dtype --
+    # explicit .astype at the end guards against this rather than relying
+    # on every intermediate op to preserve float32.
+    freqs = np.exp(-np.log(max_period) * np.arange(half, dtype=backend.default_dtype()) / half)
+    freqs = freqs.astype(backend.default_dtype())
     args = t[:, None] * freqs[None, :]
     emb = np.concatenate([np.sin(args), np.cos(args)], axis=-1)
     if dim % 2 == 1:
-        emb = np.concatenate([emb, np.zeros((emb.shape[0], 1))], axis=-1)
+        emb = np.concatenate([emb, np.zeros((emb.shape[0], 1), dtype=backend.default_dtype())], axis=-1)
     return emb
 
 class UNetDenoiser:
-    def __init__(self, in_ch, base_ch=64, time_emb_dim=128, ch_mult=(1, 2, 4),
-                 learning_rate=0.001, optimizer="adam", l2_lambda=0.0, init_method="he_normal",
-                 pool_factor=2, time_steps=1000, beta_start=1e-4, beta_end=0.02):
+    def __init__(self, in_ch: int, base_ch: int = 64, time_emb_dim: int = 128,
+                 ch_mult: Tuple[int, ...] = (1, 2, 4),
+                 learning_rate: float = 0.001, optimizer: str = "adam", l2_lambda: float = 0.0,
+                 init_method: str = "he_normal",
+                 pool_factor: int = 2, time_steps: int = 1000, beta_start: float = 1e-4,
+                 beta_end: float = 0.02) -> None:
         self.in_ch = in_ch
         self.base_ch = base_ch
         self.time_emb_dim = time_emb_dim
@@ -38,7 +48,15 @@ class UNetDenoiser:
         self.betas = np.linspace(beta_start, beta_end, time_steps, dtype=backend.default_dtype())
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = np.cumprod(self.alphas)
-        self.alphas_cumprod_prev = np.concatenate([np.array([1.0]), self.alphas_cumprod[:-1]])
+        # np.array([1.0]) defaults to float64; concatenating it with the
+        # (float32-by-default) alphas_cumprod array would upcast the WHOLE
+        # result to float64 -- which then contaminates posterior_variance
+        # below, and from there every sample() call that reads it
+        # (array-array ops promote to the higher precision, unlike
+        # scalar-array ops, which don't).
+        self.alphas_cumprod_prev = np.concatenate([
+            np.array([1.0], dtype=backend.default_dtype()), self.alphas_cumprod[:-1]
+        ])
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
         self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
@@ -79,20 +97,20 @@ class UNetDenoiser:
         self.out_net = NeuralNet(**net_kwargs)
         self.out_net.add_conv2d(base_ch * ch_mult[0], in_ch, k=3, activation="linear", init_method=init_method, padding="same")
 
-    def _add_time_to_feature(self, x, t_emb):
+    def _add_time_to_feature(self, x: Any, t_emb: Any) -> Any:
         B, C, H, W = x.shape
         if t_emb.shape[1] == C:
             return x + t_emb.reshape(B, C, 1, 1)
         return x
 
-    def _downsample(self, x):
+    def _downsample(self, x: Any) -> Any:
         B, C, H, W = x.shape
         p = self.pool_factor
         if H < p or W < p:
             return x
         return x[:, :, :H//p*p, :W//p*p].reshape(B, C, H//p, p, W//p, p).mean(axis=(3, 5))
 
-    def _upsample(self, x, target_H, target_W):
+    def _upsample(self, x: Any, target_H: int, target_W: int) -> Any:
         B, C, H, W = x.shape
         if H == target_H and W == target_W:
             return x
@@ -109,7 +127,7 @@ class UNetDenoiser:
             x = np.pad(x, ((0,0), (0,0), (0, pad_h), (0, pad_w)), mode='constant')
         return x
 
-    def forward(self, x, t):
+    def forward(self, x: Any, t: Any) -> Any:
         x = np.asarray(x, dtype=backend.default_dtype())
         if x.ndim == 3:
             x = x.reshape(1, *x.shape)
@@ -162,7 +180,7 @@ class UNetDenoiser:
                 out = np.pad(out, ((0,0), (0,0), (0, pad_h), (0, pad_w)), mode='constant')
         return out
 
-    def _resize_backward(self, delta, H, W, target_H, target_W):
+    def _resize_backward(self, delta: Any, H: int, W: int, target_H: int, target_W: int) -> Any:
         """Invert a forward crop-then-zero-pad from (H, W) to (target_H,
         target_W) (no repeat/scale involved -- see `_upsample_backward` for
         that). Cropped regions simply get zero gradient (they were dropped
@@ -174,7 +192,7 @@ class UNetDenoiser:
         grad[:, :, :copy_H, :copy_W] = delta[:, :, :copy_H, :copy_W]
         return grad
 
-    def _upsample_backward(self, delta, H, W, target_H, target_W):
+    def _upsample_backward(self, delta: Any, H: int, W: int, target_H: int, target_W: int) -> Any:
         """Exact inverse of `_upsample(x, target_H, target_W)` for an input
         of spatial size (H, W): nearest-neighbor repeat by (scale_h,
         scale_w), then crop-or-pad to (target_H, target_W)."""
@@ -189,23 +207,18 @@ class UNetDenoiser:
         B, C = delta.shape[0], delta.shape[1]
         return grad_rep.reshape(B, C, H, scale_h, W, scale_w).sum(axis=(3, 5))
 
-    def backward(self, grad_output):
-        """Backprop a gradient w.r.t. `forward()`'s output through every
-        subnetwork (time_net, encoders, bottleneck, decoders, out_net) in
-        exact reverse of `forward()`'s order, populating each subnetwork's
-        `.deltas`/per-layer gradients so `.update()` can be called on each
-        (see `train_step`). Does not return a gradient w.r.t. the raw input
-        `x` -- nothing downstream of `forward()`'s input needs it.
+    def backward(self, grad_output: Any) -> None:
+        """Backprop a gradient w.r.t. forward()'s output through every subnetwork
+        (time_net, encoders, bottleneck, decoders, out_net) in exact reverse of
+        forward()'s order, populating each one's .deltas and parameter gradients
+        so .update() can be called on each. Returns no gradient w.r.t. `x` --
+        nothing downstream needs it."""
 
-        Mirrors `forward()`'s structure precisely: `out_net` -> reverse over
-        `decoders` -> `bottleneck` -> reverse over `encoders` -> `time_net`.
-        Every skip connection is used in exactly two places in `forward()`
-        (its matching decoder's concat, and -- except at the deepest level --
-        the next encoder's downsample input / the bottleneck), so its
-        gradient is the *sum* of both paths' contributions before it's
-        routed on backward through the encoder that produced it.
-        """
-        from ..backward import avgpool2d_backward
+        # Every skip connection is used twice in forward() -- its matching
+        # decoder's concat, and (except at the deepest level) the next encoder's
+        # downsample input or the bottleneck -- so its gradient is the SUM of both
+        # paths before being routed back through the encoder that produced it.
+        from ..nn.backward import avgpool2d_backward
         from ._shared import _manual_sequential_backward, _conv_stack_input_gradient
 
         grad_output = np.asarray(grad_output, dtype=backend.default_dtype())
@@ -213,7 +226,7 @@ class UNetDenoiser:
         t_emb_dim = self.time_net.outputs[-1].shape[1]
         d_t_emb = np.zeros((grad_output.shape[0], t_emb_dim), dtype=backend.default_dtype())
 
-        def consume_time_add(delta, net):
+        def consume_time_add(delta: Any, net: Any) -> Any:
             # `delta`: gradient w.r.t. a tensor that (if channel counts
             # match) had t_emb broadcast-added to it. Broadcast-add's
             # backward passes `delta` through unchanged to both operands --
@@ -293,17 +306,17 @@ class UNetDenoiser:
         # --- time embedding MLP ---
         _manual_sequential_backward(self.time_net, d_t_emb)
 
-    def _predict_noise(self, x_t, t):
+    def _predict_noise(self, x_t: Any, t: Any) -> Any:
         return self.forward(x_t, t)
 
-    def train_step(self, x_0):
+    def train_step(self, x_0: Any) -> float:
         """One DDPM training step: sample a random timestep per example,
         noise `x_0` accordingly, predict the noise via `forward()`, MSE
         loss against the true noise, backprop + update every subnetwork."""
         x_0 = np.asarray(x_0, dtype=backend.default_dtype())
         batch_size = x_0.shape[0]
         t = np.random.randint(0, self.time_steps, size=batch_size)
-        noise = np.random.randn(*x_0.shape)
+        noise = np.random.randn(*x_0.shape).astype(backend.default_dtype())
         sqrt_acp = self.sqrt_alphas_cumprod[t].reshape(-1, 1, 1, 1)
         sqrt_omacp = self.sqrt_one_minus_alphas_cumprod[t].reshape(-1, 1, 1, 1)
         x_t = sqrt_acp * x_0 + sqrt_omacp * noise
@@ -317,7 +330,7 @@ class UNetDenoiser:
             net.update()
         return loss
 
-    def Train(self, X_train, epochs=10, batch_size=16, verbose=True):
+    def Train(self, X_train: Any, epochs: int = 10, batch_size: int = 16, verbose: bool = True) -> List[float]:
         X = np.asarray(X_train, dtype=backend.default_dtype())
         n_samples = X.shape[0]
         history = []
@@ -334,13 +347,14 @@ class UNetDenoiser:
                 print(f"Epoch {epoch+1}/{epochs} - UNet denoising loss: {avg_loss:.6f}")
         return history
 
-    def sample(self, n_samples=16, shape=None, clip=None):
+    def sample(self, n_samples: int = 16, shape: Optional[Tuple[int, ...]] = None,
+               clip: Optional[Tuple[float, float]] = None) -> Any:
         """Standard DDPM ancestral sampling (same formula as
         `DiffusionModel.sample`), driven by this class's own noise
         schedule."""
         if shape is None:
             raise ValueError("sample() requires shape=(C, H, W) -- UNetDenoiser has no fixed data_shape.")
-        x = np.random.randn(n_samples, *shape)
+        x = np.random.randn(n_samples, *shape).astype(backend.default_dtype())
         for t_step in reversed(range(self.time_steps)):
             t = np.full(n_samples, t_step, dtype=np.int64)
             pred_noise = self._predict_noise(x, t)
@@ -352,12 +366,68 @@ class UNetDenoiser:
             mean = coef1 * (x - coef2 * pred_noise)
             if t_step > 0:
                 variance = self.posterior_variance[t].reshape(-1, 1, 1, 1)
-                x = mean + np.sqrt(variance) * np.random.randn(*x.shape)
+                noise = np.random.randn(*x.shape).astype(backend.default_dtype())
+                x = mean + np.sqrt(variance) * noise
             else:
                 x = mean
         if clip is not None:
             x = np.clip(x, clip[0], clip[1])
         return x
 
-    def get_params(self):
+    def sample_ddim(self, n_samples: int = 16, shape: Optional[Tuple[int, ...]] = None, n_steps: int = 50,
+                     eta: float = 0.0, clip: Optional[Tuple[float, float]] = None) -> Any:
+        """DDIM fast sampling: `n_steps` denoiser forward-passes over a
+        strided subsequence of the full `time_steps` schedule, instead of
+        `sample()`'s `time_steps` full ancestral-sampling steps (ported
+        from DiffusionModel.sample_ddim -- same math, driven by this
+        class's own noise schedule/`_predict_noise`). `eta=0.0` (default)
+        is fully deterministic; `eta=1.0` reproduces `sample()`'s
+        DDPM-like stochastic behavior at each subsequence step.
+        """
+        if shape is None:
+            raise ValueError("sample_ddim() requires shape=(C, H, W) -- UNetDenoiser has no fixed data_shape.")
+        x = np.random.randn(n_samples, *shape).astype(backend.default_dtype())
+
+        # Strided descending timestep subsequence, e.g. n_steps=50 out of
+        # time_steps=1000 -> roughly every 20th timestep.
+        steps = np.unique(np.linspace(0, self.time_steps - 1, n_steps).astype(int))[::-1]
+
+        for i, t_step in enumerate(steps):
+            t = np.full(n_samples, t_step, dtype=np.int64)
+            pred_noise = self._predict_noise(x, t)
+
+            alpha_cumprod_t = self.alphas_cumprod[t_step]
+            # The final step's alpha_cumprod_prev is a bare Python float
+            # (1.0), not an array-derived value like every other step --
+            # cast explicitly so this step is dtype-consistent with every
+            # other one (see DiffusionModel.sample_ddim for the full
+            # rationale: np.sqrt()/Python's max() on a plain literal
+            # silently upcast to float64 otherwise, and CuPy rejects an
+            # implicit device->host conversion from calling a bare dtype
+            # constructor directly on an existing device array).
+            alpha_cumprod_prev = self.alphas_cumprod[steps[i + 1]] if i < len(steps) - 1 \
+                else np.asarray(1.0, dtype=backend.default_dtype())
+
+            x0_pred = (x - np.sqrt(1.0 - alpha_cumprod_t) * pred_noise) / np.sqrt(alpha_cumprod_t)
+            if clip is not None:
+                x0_pred = np.clip(x0_pred, clip[0], clip[1])
+
+            sigma_t = eta * np.sqrt(
+                (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod_t)
+            ) * np.sqrt(1.0 - alpha_cumprod_t / alpha_cumprod_prev) if alpha_cumprod_prev < 1.0 else 0.0
+            sigma_t = np.asarray(sigma_t, dtype=backend.default_dtype())
+            zero = np.asarray(0.0, dtype=backend.default_dtype())
+            dir_coeff = np.sqrt(np.maximum(zero, 1.0 - alpha_cumprod_prev - sigma_t ** 2))
+            dir_coeff = np.asarray(dir_coeff, dtype=backend.default_dtype())
+
+            x = np.sqrt(alpha_cumprod_prev) * x0_pred + dir_coeff * pred_noise
+            if sigma_t > 0:
+                noise = np.random.randn(*x.shape).astype(backend.default_dtype())
+                x = x + sigma_t * noise
+
+        if clip is not None:
+            x = np.clip(x, clip[0], clip[1])
+        return x
+
+    def get_params(self) -> List[Any]:
         return [self.time_net] + self.encoders + [self.bottleneck] + self.decoders + [self.out_net]

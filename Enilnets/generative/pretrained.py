@@ -3,7 +3,9 @@ matching well-known network shapes, for loading your own converted
 pretrained weights via `.set_weights()`. Enilnets never downloads or embeds
 any pretrained weights itself.
 """
-from ..base import NeuralNet
+from typing import Any
+
+from ..core.base import NeuralNet
 
 _VGG16_BLOCKS = [
     [64, 64],
@@ -14,25 +16,19 @@ _VGG16_BLOCKS = [
 ]
 
 
-def build_vgg16_feature_extractor(up_to_block=5, input_ch=3, init_method="he_normal"):
-    """Standard VGG16 conv/pool skeleton (through `up_to_block`, 1-5),
-    randomly initialized -- call `.set_weights()` on the returned model with
-    your own converted pretrained weights before using it for real features.
+def build_vgg16_feature_extractor(up_to_block: int = 5, input_ch: int = 3,
+                                   init_method: str = "he_normal") -> Any:
+    """Randomly-initialized VGG16 conv/pool skeleton through `up_to_block`
+    (1-5), with no classifier head. Call `.set_weights()` with your own
+    converted pretrained weights before using it for real features.
 
-    up_to_block: how many of VGG16's 5 conv blocks to include (1-5). Full
-        VGG16 (up_to_block=5) has 13 conv layers: [64,64] -> pool,
-        [128,128] -> pool, [256,256,256] -> pool, [512,512,512] -> pool,
-        [512,512,512] -> pool, each conv k=3 with padding="same" so spatial
-        size only changes at the pooling steps, matching the real VGG16
-        architecture.
+    Full VGG16 (up_to_block=5) is 13 conv layers -- [64,64], [128,128],
+    [256,256,256], [512,512,512], [512,512,512], each followed by a pool,
+    every conv k=3 padding="same" so spatial size changes only at the pools.
 
-    Returns a `NeuralNet` with no classifier head -- `.Forward(x,
-    training=False)` gives conv feature maps directly. Pass its bound
-    `.Forward` method as `vgg_loss(..., vgg_features=model.Forward)`, or use
-    the model itself as `inception_score(..., classifier=...)`-style
-    duck-typed feature/logit source (any object with
-    `.Forward(batch) -> (N, ...)` works).
-    """
+    `.Forward(x, training=False)` returns conv feature maps directly; pass
+    the bound method anywhere a duck-typed feature source is wanted (e.g.
+    `vgg_loss(..., vgg_features=model.Forward)`)."""
     if not (1 <= up_to_block <= 5):
         raise ValueError(f"up_to_block must be between 1 and 5, got {up_to_block}")
     model = NeuralNet()

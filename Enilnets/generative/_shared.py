@@ -1,29 +1,22 @@
 """Small helpers shared across generative models that manually backprop
 through a standalone `NeuralNet` subnetwork given only a gradient w.r.t. its
 final output (i.e. outside the normal loss/Backward(targets=...) path)."""
+from typing import Any
 
 
-def _manual_sequential_backward(subnetwork, output_grad):
-    """Backprop through `subnetwork` (already `Forward(..., training=True)`'d)
-    given the gradient w.r.t. its final ACTIVATED output -- i.e. exactly
-    what `subnetwork.Forward(...)` itself returned (the natural convention:
-    "how does the loss change if this network's output changed"). Populates
-    `subnetwork.deltas` and every layer's per-parameter gradients, ready for
-    `subnetwork.update()` (or `subnetwork.compute_gradients()` if you want to
-    inspect the gradients first).
+def _manual_sequential_backward(subnetwork: Any, output_grad: Any) -> None:
+    """Backprop through `subnetwork` (already Forward'd with training=True)
+    given the gradient w.r.t. its final ACTIVATED output -- i.e. exactly what
+    Forward() returned. Populates `subnetwork.deltas` and every layer's
+    parameter gradients, ready for `.update()`."""
 
-    Internally converts `output_grad` to the pre-activation `dL/dz` form
-    that `NeuralNet.Backward`'s `output_delta=` parameter actually expects
-    (via the last layer's activation derivative) before delegating to that
-    existing path (which already fully supports conv2d -- including
-    stride/padding -- dense, and every other layer type). Skipping this
-    conversion is a real bug for any subnetwork whose last layer isn't
-    linear (`derivative(...)` isn't 1 everywhere) -- e.g. `UNetDenoiser`'s
-    swish-activated encoder/decoder/bottleneck blocks, as opposed to
-    `DiffusionModel`'s denoisers, which happen to always end in a linear
-    layer and so never exposed this distinction.
-    """
-    from ..activations import derivative
+    # `output_grad` is converted to the pre-activation dL/dz form that
+    # NeuralNet.Backward's `output_delta=` actually expects, via the last
+    # layer's activation derivative, before delegating to that path. Skipping
+    # the conversion is a real bug for any subnetwork whose last layer is not
+    # linear -- e.g. UNetDenoiser's swish-activated blocks. DiffusionModel's
+    # denoisers always end linear, which is why this never surfaced there.
+    from ..nn.activations import derivative
     last = subnetwork.layers[-1]
     z = subnetwork.pre_activations[-1] if subnetwork.pre_activations[-1] is not None else subnetwork.outputs[-1]
     pre_activation_delta = output_grad * derivative(
@@ -33,7 +26,7 @@ def _manual_sequential_backward(subnetwork, output_grad):
     subnetwork.Backward(None, output_delta=pre_activation_delta)
 
 
-def _conv_stack_input_gradient(subnetwork):
+def _conv_stack_input_gradient(subnetwork: Any) -> Any:
     """Given a `NeuralNet` built purely from `conv2d` layers whose
     `subnetwork.deltas` has already been populated (via
     `_manual_sequential_backward` or `.Backward(...)`), return the gradient
@@ -44,7 +37,7 @@ def _conv_stack_input_gradient(subnetwork):
     the same primitive the main `Backward()` loop uses for every
     interior layer, just applied one layer further.
     """
-    from ..backward import conv2d_backward_input
+    from ..nn.backward import conv2d_backward_input
     first_layer = subnetwork.layers[0]
     if first_layer["type"] != "conv2d":
         raise ValueError(
